@@ -32,10 +32,10 @@ def generate_pod_batch(
         volcano.sh/vgpu-cores: core_demand
     """
     if memory_choices is None:
-        memory_choices = [2048, 4096, 6144, 8192, 10240]
+        memory_choices = [1024, 2048, 3072, 4096, 5120]
 
     if core_choices is None:
-        core_choices = [5, 10, 15, 20, 25]
+        core_choices = [5, 10, 15]
 
     pods = []
 

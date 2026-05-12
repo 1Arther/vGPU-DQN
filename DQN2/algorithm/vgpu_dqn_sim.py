@@ -1,29 +1,27 @@
 """
 vGPU 单节点负载均衡仿真实验脚本。
 
-本脚本只负责：
+本脚本负责：
 1. 加载 / 生成 vGPU 仿真数据；
 2. 构建 GPU-Pod 二分图；
 3. 使用 GNN-DQN 进行调度决策；
-4. 与 Least-loaded、Random baseline 进行对比；
-5. 输出 reward、balance_score、loss、success_rate 等实验结果。
+4. 与 Least-loaded、Random baseline 对比；
+5. 输出 reward、balance_score、loss、success_rate 等实验结果；
+6. 保存验证集表现最好的 best checkpoint，并在最终测试时加载 best model。
 
-数据生成逻辑已拆分到：
-    vgpu_gpu_generator.py
-    vgpu_pod_generator.py
+数据生成逻辑拆分到：
+    DQN2/vgpu_gpu_generator.py
+    DQN2/vgpu_pod_generator.py
 
 核心抽象：
-    GPU  = 单节点内的一张物理 GPU
-    Pod  = 一个申请 vGPU 资源的任务
-    action = (gpu_idx, pod_idx)，表示把某个 Pod 分配到某张 GPU 上
+    GPU = 单节点内的一张物理 GPU
+    Pod = 一个申请 vGPU 资源的任务
+    action = (gpu_idx, pod_idx)
 
-建模原则：
-1. DQN 和 baseline 使用同一批测试 Pod；
-2. GPU 和 Pod 任务数据保存为 JSON，保证实验可复现；
-3. 最终测试时关闭 epsilon 探索；
-4. 默认 Pod 数改为 20，6 个 Pod 只适合调试；
-5. balance_score 是最终评价指标，reward 是训练信号，loss 只反映训练稳定性；
-6. pod_count 只作为状态特征，不进入 reward / balance_score。
+评价指标：
+    balance_score 越低越好；
+    success_rate 越高越好；
+    loss 只看训练稳定性，不是最终性能指标。
 """
 
 import argparse
@@ -68,6 +66,7 @@ except ModuleNotFoundError:
         load_pod_batches,
         save_pod_batches,
     )
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -117,6 +116,7 @@ class PrioritizedReplayBuffer:
             priority_sample_size,
             p=probabilities,
         )
+
         random_indices = np.random.choice(
             len(self.buffer),
             random_sample_size,
@@ -229,7 +229,7 @@ class GNNBasedDQNAgent:
         task_in_dim: int,
         gnn_hidden_dim: int = 128,
         q_hidden_dim: int = 128,
-        lr: float = 1e-3,
+        lr: float = 3e-4,
         gamma: float = 0.9,
         epsilon: float = 1.0,
         epsilon_min: float = 0.05,
@@ -661,12 +661,47 @@ def balance_score(gpus_info: List[Dict]) -> float:
     return float(np.std(memory_usages) + np.std(core_usages))
 
 
-def calculate_vgpu_reward(gpus_info: List[Dict]) -> float:
+def calculate_step_reward(
+    gpus_info: List[Dict],
+    allocated_count: int,
+    total_pods: int,
+) -> float:
     """
-    reward 和 balance_score 对齐。
-    balance_score 越小，reward 越大。
+    每一步分配后的即时奖励。
+
+    目标：
+        balance_score 越低越好；
+        success_rate 越高越好。
     """
-    return 1.0 - balance_score(gpus_info)
+    current_balance = balance_score(gpus_info)
+    current_success_rate = allocated_count / total_pods
+
+    return (
+        1.0
+        - current_balance
+        + 0.2 * current_success_rate
+    )
+
+
+def calculate_terminal_reward(
+    gpus_info: List[Dict],
+    allocated_count: int,
+    total_pods: int,
+) -> float:
+    """
+    episode 结束时的终止奖励。
+
+    终止奖励更强调最终结果：
+        success_rate 要高；
+        balance_score 要低。
+    """
+    final_balance = balance_score(gpus_info)
+    final_success_rate = allocated_count / total_pods
+
+    return (
+        2.0 * final_success_rate
+        - final_balance
+    )
 
 
 def format_gpu_loads(gpus_info: List[Dict]) -> str:
@@ -702,6 +737,30 @@ def run_one_episode(
     pods_info: List[Dict],
     train: bool = True,
 ):
+    """
+    一轮完整调度过程。
+
+    输入：
+        gpu_templates:
+            GPU 初始资源模板。
+
+        pods_info:
+            当前 episode 的 Pod 任务批次。
+
+        train:
+            True  表示训练，会写入 replay buffer；
+            False 表示测试，只执行策略，不学习。
+
+    返回：
+        total_reward
+        balance_score
+        allocations
+        gpus
+        pods
+        step_count
+        allocated_count
+        success_rate
+    """
     gpus = reset_gpus_from_template(gpu_templates)
     pods = copy.deepcopy(pods_info)
 
@@ -720,15 +779,20 @@ def run_one_episode(
     while len(allocated_pod_indices) < len(pods):
         _, _, adj = graph_data
 
-        adj_t = torch.tensor(
+        valid_mask = torch.tensor(
             adj,
             dtype=torch.float32,
             device=device,
-        )
-        valid_mask = adj_t > 0
+        ) > 0
 
         if not valid_mask.any():
-            total_reward -= 5.0
+            allocated_count = len(allocations)
+            reward = -5.0 + calculate_terminal_reward(
+                gpus,
+                allocated_count,
+                len(pods),
+            )
+            total_reward += reward
             break
 
         action = agent.act(
@@ -743,6 +807,7 @@ def run_one_episode(
             reward = -5.0
             next_graph_data = graph_data
             done = True
+
         else:
             update_gpu_resources(
                 gpus[gpu_idx],
@@ -752,7 +817,13 @@ def run_one_episode(
             allocations[pod["task_id"]] = gpu_idx
             allocated_pod_indices.add(pod_idx)
 
-            reward = calculate_vgpu_reward(gpus)
+            allocated_count = len(allocations)
+
+            reward = calculate_step_reward(
+                gpus,
+                allocated_count,
+                len(pods),
+            )
 
             next_graph_data = build_vgpu_graph(
                 gpus,
@@ -764,6 +835,13 @@ def run_one_episode(
                 len(allocated_pod_indices) == len(pods)
                 or not np.any(next_graph_data[2] > 0)
             )
+
+            if done:
+                reward += calculate_terminal_reward(
+                    gpus,
+                    allocated_count,
+                    len(pods),
+                )
 
         total_reward += reward
         step_count += 1
@@ -801,6 +879,13 @@ def least_loaded_baseline(
     gpu_templates: List[Dict],
     pods: List[Dict],
 ):
+    """
+    启发式基线：
+        每次选择当前 memory_used + core_used 最低的 GPU。
+
+    注意：
+        不使用 pod_count 作为负载均衡目标。
+    """
     gpus = reset_gpus_from_template(gpu_templates)
     allocations = {}
 
@@ -881,6 +966,11 @@ def evaluate_on_test_batches(
     gpu_templates: List[Dict],
     test_batches: List[List[Dict]],
 ):
+    """
+    用固定测试集评估 DQN 和 baseline。
+
+    测试时关闭 epsilon 探索。
+    """
     old_epsilon = agent.epsilon
     agent.epsilon = 0.0
 
@@ -1000,6 +1090,20 @@ def train(args):
         "vgpu_sim_training_log.csv",
     )
 
+    model_path = os.path.join(
+        args.output_dir,
+        "vgpu_dqn_sim.pth",
+    )
+
+    best_model_path = os.path.join(
+        args.output_dir,
+        "vgpu_dqn_sim_best.pth",
+    )
+
+    best_eval_score = float("inf")
+    best_eval_success = -1.0
+    best_episode = -1
+
     with open(
         log_path,
         "w",
@@ -1019,6 +1123,11 @@ def train(args):
                 "allocated_count",
                 "success_rate",
                 "train_batch_id",
+                "eval_balance_score",
+                "eval_success_rate",
+                "best_eval_score",
+                "best_eval_success",
+                "best_episode",
             ]
         )
 
@@ -1048,6 +1157,53 @@ def train(args):
             if episode % args.target_update == 0:
                 agent.update_target_model()
 
+            eval_balance_score = ""
+            eval_success_rate = ""
+
+            if episode % args.eval_interval == 0:
+                eval_result = evaluate_on_test_batches(
+                    agent,
+                    gpu_templates,
+                    test_batches,
+                )
+
+                eval_balance_score = eval_result["dqn_avg_score"]
+                eval_success_rate = eval_result["dqn_avg_success"]
+
+                is_better = False
+
+                # success_rate 接近时，优先选择 balance_score 更低的模型
+                if eval_success_rate >= best_eval_success - args.success_tolerance:
+                    if eval_balance_score < best_eval_score:
+                        is_better = True
+
+                # success_rate 明显更高时，也认为更好
+                if eval_success_rate > best_eval_success + args.success_tolerance:
+                    is_better = True
+
+                if is_better:
+                    best_eval_score = eval_balance_score
+                    best_eval_success = eval_success_rate
+                    best_episode = episode
+
+                    torch.save(
+                        {
+                            "gnn_encoder": agent.gnn_encoder.state_dict(),
+                            "q_net": agent.q_net.state_dict(),
+                            "args": vars(args),
+                            "best_episode": best_episode,
+                            "best_eval_score": best_eval_score,
+                            "best_eval_success": best_eval_success,
+                        },
+                        best_model_path,
+                    )
+
+                    print(
+                        f"new best model saved: episode={best_episode}, "
+                        f"eval_balance_score={best_eval_score:.4f}, "
+                        f"eval_success_rate={best_eval_success:.4f}"
+                    )
+
             writer.writerow(
                 [
                     episode,
@@ -1059,11 +1215,16 @@ def train(args):
                     allocated_count,
                     success_rate,
                     batch_id,
+                    eval_balance_score,
+                    eval_success_rate,
+                    best_eval_score if best_episode > 0 else "",
+                    best_eval_success if best_episode > 0 else "",
+                    best_episode if best_episode > 0 else "",
                 ]
             )
 
             if episode % args.log_interval == 0:
-                print(
+                msg = (
                     f"episode={episode:04d} "
                     f"reward={reward:.4f} "
                     f"balance_score={score:.4f} "
@@ -1072,10 +1233,19 @@ def train(args):
                     f"epsilon={agent.epsilon:.4f}"
                 )
 
-    model_path = os.path.join(
-        args.output_dir,
-        "vgpu_dqn_sim.pth",
-    )
+                if eval_balance_score != "":
+                    msg += (
+                        f" eval_balance_score={eval_balance_score:.4f} "
+                        f"eval_success_rate={eval_success_rate:.2f}"
+                    )
+
+                if best_episode > 0:
+                    msg += (
+                        f" best_episode={best_episode} "
+                        f"best_eval_score={best_eval_score:.4f}"
+                    )
+
+                print(msg)
 
     torch.save(
         {
@@ -1085,6 +1255,22 @@ def train(args):
         },
         model_path,
     )
+
+    # 最终测试前加载验证集最优模型
+    if os.path.exists(best_model_path):
+        checkpoint = torch.load(best_model_path, map_location=device)
+
+        agent.gnn_encoder.load_state_dict(checkpoint["gnn_encoder"])
+        agent.q_net.load_state_dict(checkpoint["q_net"])
+        agent.update_target_model()
+
+        print(
+            f"\nloaded best model from episode={checkpoint['best_episode']}, "
+            f"eval_balance_score={checkpoint['best_eval_score']:.4f}, "
+            f"eval_success_rate={checkpoint['best_eval_success']:.4f}"
+        )
+    else:
+        print("\nwarning: best model not found, using final model")
 
     eval_result = evaluate_on_test_batches(
         agent,
@@ -1153,7 +1339,8 @@ def train(args):
     print(f"                   loads={format_gpu_loads(random_gpus)}")
 
     print(f"\ntraining log saved to: {log_path}")
-    print(f"model saved to       : {model_path}")
+    print(f"final model saved to : {model_path}")
+    print(f"best model saved to  : {best_model_path}")
     print(f"data dir             : {args.data_dir}")
 
 
@@ -1260,6 +1447,20 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--eval-interval",
+        type=int,
+        default=100,
+        help="每隔多少轮在固定测试集上评估一次",
+    )
+
+    parser.add_argument(
+        "--success-tolerance",
+        type=float,
+        default=0.005,
+        help="判断 best model 时允许的 success_rate 误差",
+    )
+
+    parser.add_argument(
         "--log-interval",
         type=int,
         default=20,
@@ -1269,8 +1470,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--lr",
         type=float,
-        default=1e-3,
-        help="学习率",
+        default=3e-4,
+        help="学习率，建议先用 0.0003",
     )
 
     parser.add_argument(
