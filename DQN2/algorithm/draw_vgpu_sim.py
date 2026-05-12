@@ -141,16 +141,19 @@ def plot_training_log(
 
     metrics = [
     "reward",
+    "objective",
     "balance_score",
+    "success_rate",
+    "failure_rate",
+    "allocated_count",
+    "failure_count",
     "loss",
     "epsilon",
-    "success_rate",
-    "allocated_count",
-    "steps",
+    "eval_objective",
     "eval_balance_score",
     "eval_success_rate",
-    "best_eval_score",
-    "best_eval_success",
+    "eval_failure_rate",
+    "best_eval_objective",
 ]
 
     for metric in metrics:

@@ -1,41 +1,27 @@
 """
 hami-core vGPU GNN-DQN simulation.
 
-新改动：
-1. 支持动态 GPU batch：
-   - 每个训练 batch 的 GPU 数量和 GPU 资源可以不同；
-   - 每个测试 batch 的 GPU 数量和 GPU 资源也可以不同。
+实验 3 版本：负载强度控制实验。
 
-2. 支持动态 Pod batch：
-   - 每个训练 batch 的 Pod 数量和资源需求可以不同；
-   - 每个测试 batch 的 Pod 数量和资源需求也可以不同。
-
-3. 对比方法扩展为：
+新增改动：
+1. 支持 target_load 控制 Pod 总需求。
+2. 支持动态 GPU batch 和动态 Pod batch。
+3. 支持固定规模实验：--gpus 3。
+4. 支持动态规模实验：--min-gpus 3 --max-gpus 8。
+5. 对比方法：
    - DQN
    - Volcano-binpack
    - Volcano-spread
    - Simple-spread
    - Random
-
-4. 增加综合目标函数：
-   objective = success_weight * success_rate
-             - balance_weight * balance_score
-             - failure_weight * failure_rate
-
-5. best checkpoint 按 DQN 在固定测试集上的 objective 选择。
-   baseline 只用于最终比较，不参与 best model 选择。
-
-6. 增加 early stopping。
-
-7. 保存测试明细：
-   - test_comparison_detail.csv
-   - test_comparison_summary.csv
+6. best checkpoint 按 weighted objective 选择。
+7. 增加 early stopping。
+8. 保存 test_comparison_detail.csv 和 test_comparison_summary.csv。
 """
 
 import argparse
 import copy
 import csv
-import json
 import os
 import random
 from typing import Dict, List, Tuple
@@ -91,7 +77,7 @@ def seed_everything(seed: int):
 
 
 # ============================================================
-# 1. 经验回放
+# 1. Prioritized Replay Buffer
 # ============================================================
 class PrioritizedReplayBuffer:
     def __init__(self, capacity: int, alpha: float = 0.6):
@@ -468,6 +454,7 @@ def load_or_generate_vgpu_dataset(args):
             gpu_core_choices=gpu_core_choices,
             pod_memory_choices=pod_memory_choices,
             pod_core_choices=pod_core_choices,
+            target_load=args.target_load,
         )
 
         test_scenarios = generate_scenarios(
@@ -480,6 +467,7 @@ def load_or_generate_vgpu_dataset(args):
             gpu_core_choices=gpu_core_choices,
             pod_memory_choices=pod_memory_choices,
             pod_core_choices=pod_core_choices,
+            target_load=args.target_load,
         )
 
         save_scenarios(train_scenarios, train_path)
@@ -580,8 +568,9 @@ def balance_score(gpus_info: List[Dict]) -> float:
     """
     负载均衡指标，越低越好。
 
-    当前只看：
+    只看资源使用率：
         std(memory_usage) + std(core_usage)
+
     不看 pod_count。
     """
     memory_usages = [
@@ -607,9 +596,6 @@ def calculate_objective(
     """
     综合评价目标，越大越好。
 
-    新改动：
-        把成功率、负载均衡、失败率统一成一个 objective。
-
     objective = α * success_rate - β * balance_score - γ * failure_rate
     """
     failure_rate = 1.0 - success_rate
@@ -629,9 +615,9 @@ def calculate_step_reward(
     """
     每一步奖励。
 
-    保留较温和的 step reward，主要让模型知道：
-        1. 成功分配是好事；
-        2. 负载越均衡越好。
+    作用：
+        1. 鼓励成功分配；
+        2. 轻微惩罚负载不均衡。
     """
     current_balance = balance_score(gpus_info)
     current_success_rate = allocated_count / total_pods
@@ -691,7 +677,7 @@ def run_one_episode(
 
     新改动：
         输入不再是固定 gpu_templates + pods；
-        而是一个包含随机 GPU 和随机 Pod 的 scenario。
+        而是包含随机 GPU 和随机 Pod 的 scenario。
     """
     gpus = reset_gpus_from_template(scenario["gpus"])
     pods = copy.deepcopy(scenario["pods"])
@@ -791,7 +777,8 @@ def run_one_episode(
             break
 
     allocated_count = len(allocations)
-    success_rate = allocated_count / len(pods)
+    total_pods = len(pods)
+    success_rate = allocated_count / total_pods
     failure_rate = 1.0 - success_rate
     score = balance_score(gpus)
 
@@ -810,8 +797,8 @@ def run_one_episode(
         "success_rate": success_rate,
         "failure_rate": failure_rate,
         "allocated_count": allocated_count,
-        "failure_count": len(pods) - allocated_count,
-        "total_pods": len(pods),
+        "failure_count": total_pods - allocated_count,
+        "total_pods": total_pods,
         "num_gpus": len(gpus),
         "steps": step_count,
         "objective": objective,
@@ -835,15 +822,15 @@ def run_heuristic_baseline(
     """
     baseline 统一入口。
 
-    支持：
+    policy 支持：
         volcano-binpack:
-            选择放置后负载最高的 GPU，尽量压实资源。
+            选择放置后负载最高的 GPU，倾向压实资源。
 
         volcano-spread:
-            选择放置后负载最低的 GPU，尽量分散资源。
+            选择放置后负载最低的 GPU，倾向分散资源。
 
         simple-spread:
-            选择当前负载最低的 GPU，等价于原 Least-loaded 思路。
+            选择当前负载最低的 GPU。
 
         random:
             在可行 GPU 中随机选择。
@@ -888,7 +875,7 @@ def run_heuristic_baseline(
                 score = 0.0
 
             else:
-                raise ValueError(f"unknown policy: {policy}")
+                raise ValueError(f"unknown baseline policy: {policy}")
 
             candidates.append((score, idx))
 
@@ -938,10 +925,14 @@ def run_heuristic_baseline(
 # ============================================================
 # 8. 测试评估
 # ============================================================
-def result_to_row(batch_id: int, result: Dict) -> Dict:
+def result_to_row(batch_id: int, scenario: Dict, result: Dict) -> Dict:
     return {
         "batch_id": batch_id,
         "method": result["method"],
+        "target_load": scenario.get("target_load", 0.0),
+        "actual_load": scenario.get("actual_load", 0.0),
+        "memory_load": scenario.get("memory_load", 0.0),
+        "core_load": scenario.get("core_load", 0.0),
         "num_gpus": result["num_gpus"],
         "num_pods": result["total_pods"],
         "allocated_count": result["allocated_count"],
@@ -962,9 +953,8 @@ def evaluate_on_test_scenarios(
     """
     在固定测试 scenarios 上评估 DQN 和所有 baseline。
 
-    新改动：
-        返回每个 batch 的明细 detail_df；
-        返回每个方法的平均 summary_df。
+    注意：
+        测试时 DQN 关闭探索，即 epsilon = 0。
     """
     old_epsilon = agent.epsilon
     agent.epsilon = 0.0
@@ -991,7 +981,7 @@ def evaluate_on_test_scenarios(
             failed_pod_penalty=args.failed_pod_penalty,
         )
 
-        detail_rows.append(result_to_row(batch_id, dqn_result))
+        detail_rows.append(result_to_row(batch_id, scenario, dqn_result))
 
         for method in baseline_methods:
             random_seed = args.seed + 100000 + batch_id if method == "random" else None
@@ -1005,7 +995,7 @@ def evaluate_on_test_scenarios(
                 random_seed=random_seed,
             )
 
-            detail_rows.append(result_to_row(batch_id, baseline_result))
+            detail_rows.append(result_to_row(batch_id, scenario, baseline_result))
 
     agent.epsilon = old_epsilon
 
@@ -1014,6 +1004,10 @@ def evaluate_on_test_scenarios(
     summary_df = (
         detail_df.groupby("method")
         .agg(
+            target_load=("target_load", "mean"),
+            avg_actual_load=("actual_load", "mean"),
+            avg_memory_load=("memory_load", "mean"),
+            avg_core_load=("core_load", "mean"),
             avg_balance_score=("balance_score", "mean"),
             std_balance_score=("balance_score", "std"),
             avg_success_rate=("success_rate", "mean"),
@@ -1055,6 +1049,7 @@ def train(args):
     seed_everything(args.seed)
 
     print(f"Using device: {device}")
+    print(f"target_load = {args.target_load}")
 
     train_scenarios, test_scenarios = load_or_generate_vgpu_dataset(args)
 
@@ -1089,6 +1084,10 @@ def train(args):
             [
                 "episode",
                 "train_batch_id",
+                "target_load",
+                "actual_load",
+                "memory_load",
+                "core_load",
                 "num_gpus",
                 "num_pods",
                 "reward",
@@ -1201,6 +1200,10 @@ def train(args):
                 [
                     episode,
                     batch_id,
+                    scenario.get("target_load", 0.0),
+                    scenario.get("actual_load", 0.0),
+                    scenario.get("memory_load", 0.0),
+                    scenario.get("core_load", 0.0),
                     result["num_gpus"],
                     result["total_pods"],
                     result["reward"],
@@ -1226,6 +1229,8 @@ def train(args):
             if episode % args.log_interval == 0:
                 msg = (
                     f"episode={episode:04d} "
+                    f"target_load={scenario.get('target_load', 0.0):.2f} "
+                    f"actual_load={scenario.get('actual_load', 0.0):.3f} "
                     f"reward={result['reward']:.4f} "
                     f"objective={result['objective']:.4f} "
                     f"balance_score={result['balance_score']:.4f} "
@@ -1305,7 +1310,7 @@ def train(args):
 # ============================================================
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="hami-core vGPU GNN-DQN dynamic simulation"
+        description="hami-core vGPU GNN-DQN load-control simulation"
     )
 
     parser.add_argument("--episodes", type=int, default=3000)
@@ -1317,9 +1322,16 @@ def build_parser():
     parser.add_argument("--min-pods", type=int, default=20)
     parser.add_argument("--max-pods", type=int, default=80)
 
-    # 兼容旧参数：如果传了 --gpus / --pods，则固定规模
+    # 兼容固定规模实验
     parser.add_argument("--gpus", type=int, default=None)
     parser.add_argument("--pods", type=int, default=None)
+
+    parser.add_argument(
+        "--target-load",
+        type=float,
+        default=0.0,
+        help="目标负载强度。0 表示不控制负载强度，按 Pod 数量范围随机生成。",
+    )
 
     parser.add_argument(
         "--gpu-memory-choices",
@@ -1375,7 +1387,7 @@ def build_parser():
         "--early-stop-patience",
         type=int,
         default=10,
-        help="number of eval rounds without improvement before early stopping; 0 disables",
+        help="连续多少次 eval 无提升后早停；0 表示关闭早停。",
     )
 
     parser.add_argument(

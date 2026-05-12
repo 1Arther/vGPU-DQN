@@ -12,6 +12,7 @@
     avg_objective_bar.png
     balance_score_test_batches.png
     success_rate_test_batches.png
+    failure_rate_test_batches.png
     objective_test_batches.png
 """
 
