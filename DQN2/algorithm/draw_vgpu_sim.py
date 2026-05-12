@@ -48,12 +48,14 @@ def plot_metric(
     """
     画单个指标曲线。
 
-    参数：
-        df: 训练日志 DataFrame
-        x_col: 横轴，一般是 episode
-        y_col: 纵轴，例如 reward / balance_score / loss
-        output_dir: 图片保存目录
-        smooth_window: 平滑窗口
+    对普通训练指标：
+        reward / balance_score / loss / epsilon / success_rate
+        每个 episode 都有值，直接画。
+
+    对 eval 指标：
+        eval_balance_score / eval_success_rate / best_eval_score
+        只有评估轮次有值，中间是 NaN。
+        所以需要先 dropna，否则曲线会断成点。
     """
     if y_col not in df.columns:
         print(f"[skip] column not found: {y_col}")
@@ -61,13 +63,44 @@ def plot_metric(
 
     os.makedirs(output_dir, exist_ok=True)
 
-    x = df[x_col]
-    y = df[y_col]
-    y_smooth = smooth_series(y, smooth_window)
+    # 关键修改：去掉 NaN 行
+    plot_df = df[[x_col, y_col]].dropna()
+
+    if plot_df.empty:
+        print(f"[skip] no valid data for: {y_col}")
+        return
+
+    x = plot_df[x_col]
+    y = plot_df[y_col]
+
+    # eval 指标点比较少，平滑窗口不能太大
+    if y_col.startswith("eval_") or y_col.startswith("best_eval"):
+        real_smooth_window = min(smooth_window, max(1, len(y) // 5))
+    else:
+        real_smooth_window = smooth_window
+
+    y_smooth = smooth_series(y, real_smooth_window)
 
     plt.figure(figsize=(10, 6))
-    plt.plot(x, y, alpha=0.35, label=f"raw {y_col}")
-    plt.plot(x, y_smooth, linewidth=2, label=f"smoothed {y_col}")
+
+    # 加 marker，方便看评估点；同时 linestyle="-" 保证连线
+    plt.plot(
+        x,
+        y,
+        marker="o",
+        linestyle="-",
+        alpha=0.35,
+        label=f"raw {y_col}",
+    )
+
+    plt.plot(
+        x,
+        y_smooth,
+        marker="o" if y_col.startswith("eval_") else None,
+        linestyle="-",
+        linewidth=2,
+        label=f"smoothed {y_col}",
+    )
 
     plt.xlabel(x_col)
     plt.ylabel(y_col)
@@ -107,14 +140,18 @@ def plot_training_log(
         raise ValueError("CSV must contain column: episode")
 
     metrics = [
-        "reward",
-        "balance_score",
-        "loss",
-        "epsilon",
-        "success_rate",
-        "allocated_count",
-        "steps",
-    ]
+    "reward",
+    "balance_score",
+    "loss",
+    "epsilon",
+    "success_rate",
+    "allocated_count",
+    "steps",
+    "eval_balance_score",
+    "eval_success_rate",
+    "best_eval_score",
+    "best_eval_success",
+]
 
     for metric in metrics:
         plot_metric(
