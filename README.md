@@ -1,21 +1,47 @@
-下面这版可以直接作为 `README.md`。你当前仓库里的 README 还是很简单的占位内容。
+可以，先做两件事：
 
-你可以直接在服务器里执行：
+1. **把当前分支代码提交并 push 到 GitHub**
+2. **把 README.md 改成当前 hami-core / Volcano baseline / 动态 batch 版本说明**
 
-````bash
-cd ~/vGPU-DQN
-cat > README.md <<'EOF'
-# vGPU-DQN：基于 GNN-DQN 的单节点 vGPU 负载均衡仿真实验
-
-本项目基于原有 DQN 调度代码，扩展实现了一个面向单节点多 GPU 场景的 vGPU 负载均衡仿真实验框架。实验目标是模拟多个 Pod 申请 vGPU 资源时，调度器如何在多张 GPU 之间进行分配，使 GPU 间显存和算力负载尽量均衡，同时尽可能提高 Pod 调度成功率。
-
-当前版本主要用于仿真实验，不直接调用 Kubernetes / Volcano API，也不会真实创建 Pod。后续可以进一步扩展为接入 Volcano deviceshare 插件的真实调度实验。
+下面直接照着终端执行。
 
 ---
 
-## 1. 实验背景
+## 1. 先确认当前分支
 
-在 Kubernetes + Volcano 的 vGPU 场景中，一个 Pod 可以通过如下资源字段申请 vGPU：
+```bash
+cd ~/vGPU-DQN
+
+git branch --show-current
+git status
+```
+
+如果当前分支就是你现在改代码的分支，继续。
+如果你还在 `feature/vgpu-sim-generator`，也可以直接提交到这个分支。
+
+---
+
+## 2. 覆盖 README.md
+
+执行：
+
+````bash
+cat > README.md <<'EOF'
+# vGPU-DQN：面向 hami-core 的单节点 vGPU 负载均衡仿真实验
+
+本项目基于原有 DQN 调度代码，扩展实现了一个面向 **hami-core / vGPU 场景** 的单节点多 GPU 负载均衡仿真实验框架。
+
+实验目标是：在多个 Pod 申请 vGPU 资源时，学习一个 GPU-Pod 分配策略，使调度器在提高 Pod 调度成功率的同时，尽量降低 GPU 之间的显存和算力负载差异。
+
+当前版本是仿真实验版本，不直接调用 Kubernetes / Volcano API，也不会真实创建 Pod。后续可以进一步接入 Volcano deviceshare 或 HAMi 调度链路。
+
+---
+
+## 1. 当前研究场景
+
+当前主要研究的是单节点内多 GPU 的 vGPU 分配问题。
+
+Pod 请求形式参考 hami-core / Volcano vGPU 风格：
 
 ```yaml
 resources:
@@ -25,35 +51,194 @@ resources:
     volcano.sh/vgpu-cores: 10
 ````
 
-当单个节点上存在多张物理 GPU 时，不同 Pod 的 vGPU 请求需要被分配到具体 GPU 上。如果调度策略不合理，可能出现部分 GPU 资源被快速打满，而其他 GPU 仍有较多剩余资源的情况，从而造成资源碎片和负载不均衡。
-
-本项目尝试使用 GNN-DQN 学习 GPU-Pod 分配策略，并与启发式算法和随机算法进行对比。
+在单节点多 GPU 场景下，调度器需要决定每个 Pod 分配到哪张 GPU 上。若分配策略不合理，可能导致部分 GPU 被快速打满，而其他 GPU 仍有空闲资源，从而造成资源碎片、调度失败和负载不均衡。
 
 ---
 
-## 2. 当前仿真假设
+## 2. 当前版本主要改动
 
-当前实验阶段做了如下简化：
+相比原始版本，当前分支主要做了以下改动：
 
-1. 只研究单节点内部的多 GPU 负载均衡。
-2. 一个 Pod 当前只分配到一张 GPU 上。
-3. 一个 Pod 不支持跨节点分配。
-4. GPU 资源包括：
+### 2.1 支持 hami-core 风格 vGPU 资源
 
-   * `memory_total`
-   * `memory_free`
-   * `core_total`
-   * `core_free`
-   * `pod_count`
-   * `util`
-5. Pod 请求包括：
+Pod 任务包含：
 
-   * `vgpu_number`
-   * `memory_demand`
-   * `core_demand`
-6. 当前训练中 Pod 批次不同，但 GPU 模板固定。
-7. 测试阶段 DQN 关闭探索，即 `epsilon = 0`。
-8. DQN、启发式算法、随机算法使用同一批测试 Pod 进行比较。
+```text
+vgpu_number
+memory_demand
+core_demand
+```
+
+GPU 节点包含：
+
+```text
+memory_total
+memory_free
+core_total
+core_free
+pod_count
+util
+```
+
+当前默认一个 Pod 分配到一张 GPU 上，暂不做跨节点分配，也暂不做单 Pod 跨多 GPU 分配。
+
+---
+
+### 2.2 支持动态 GPU batch 和动态 Pod batch
+
+当前版本不再只使用固定 GPU 模板，而是支持每个 batch 随机生成 GPU 和 Pod。
+
+也就是说，训练时：
+
+```text
+episode 1: 一组随机 GPU + 一组随机 Pod
+episode 2: 另一组随机 GPU + 另一组随机 Pod
+...
+```
+
+测试时也是：
+
+```text
+test batch 1: 一组随机 GPU + 一组随机 Pod
+test batch 2: 另一组随机 GPU + 另一组随机 Pod
+...
+```
+
+这样可以避免模型只适应固定 GPU 和固定 Pod 分布，提高实验泛化性。
+
+---
+
+### 2.3 增加 scenario 数据结构
+
+当前每个实验 batch 被保存为一个 scenario：
+
+```json
+{
+  "batch_id": 0,
+  "mode": "hami-core",
+  "num_gpus": 3,
+  "num_pods": 30,
+  "gpus": [],
+  "pods": []
+}
+```
+
+训练集和测试集分别保存为：
+
+```text
+train_scenarios.json
+test_scenarios.json
+```
+
+---
+
+### 2.4 增加多种 baseline
+
+当前对比方法包括：
+
+```text
+DQN
+Volcano-binpack
+Volcano-spread
+Simple-spread
+Random
+```
+
+各方法含义如下：
+
+| 方法              | 含义                         |
+| --------------- | -------------------------- |
+| DQN             | 使用 GNN-DQN 学习 GPU-Pod 分配策略 |
+| Volcano-binpack | 倾向于将任务压实到已有负载较高的 GPU 上     |
+| Volcano-spread  | 倾向于将任务分散到放置后负载较低的 GPU 上    |
+| Simple-spread   | 简单选择当前负载最低的 GPU            |
+| Random          | 从所有可行 GPU 中随机选择            |
+
+其中 `Volcano-binpack` 和 `Volcano-spread` 是仿照 Volcano deviceshare 思路实现的启发式 baseline，不是直接调用 Volcano 源码。
+
+---
+
+### 2.5 增加综合目标函数
+
+当前版本不再只看成功率或只看负载均衡，而是使用统一的综合目标：
+
+```text
+objective = α * success_rate - β * balance_score - γ * failure_rate
+```
+
+默认权重为：
+
+```text
+α = 2.0
+β = 1.0
+γ = 2.0
+```
+
+其中：
+
+```text
+success_rate：调度成功率，越高越好
+balance_score：GPU 间负载不均衡程度，越低越好
+failure_rate：调度失败率，越低越好
+```
+
+因此：
+
+```text
+objective 越高越好
+```
+
+当前 best checkpoint 也是根据 DQN 在固定测试集上的 `objective` 选择，而不是根据 baseline 结果反向挑模型。
+
+---
+
+### 2.6 增加失败惩罚
+
+当 Pod 无法继续分配时，会根据失败 Pod 数量进行惩罚：
+
+```text
+failed_pod_penalty * failure_count
+```
+
+这样可以避免模型只追求表面上的均衡，而忽略大量 Pod 分配失败的问题。
+
+---
+
+### 2.7 增加 early stopping
+
+当前版本支持早停机制：
+
+```bash
+--early-stop-patience 10
+--early-stop-min-delta 1e-4
+```
+
+含义是：如果连续多次 evaluation 中 DQN 的综合 objective 没有明显提升，则提前停止训练。
+
+---
+
+### 2.8 保存完整测试比较结果
+
+测试阶段会在同一批测试场景上比较所有方法，并保存：
+
+```text
+test_comparison_detail.csv
+test_comparison_summary.csv
+```
+
+其中：
+
+```text
+test_comparison_detail.csv
+```
+
+保存每个 batch、每种方法的详细结果。
+
+```text
+test_comparison_summary.csv
+```
+
+保存每种方法在所有测试 batch 上的平均结果。
 
 ---
 
@@ -63,20 +248,20 @@ resources:
 vGPU-DQN/
 ├── DQN2/
 │   ├── algorithm/
-│   │   ├── vgpu_dqn_sim.py          # vGPU GNN-DQN 仿真实验主程序
-│   │   └── draw_vgpu_sim.py         # 训练日志画图脚本
-│   ├── vgpu_gpu_generator.py        # GPU 信息生成器
-│   ├── vgpu_pod_generator.py        # Pod 任务生成器
-│   ├── data/                        # 自动生成的实验数据
-│   ├── outputs/                     # 默认输出目录
-│   ├── outputs_30pods/              # 30 Pods 实验输出
-│   └── outputs_8gpu_80pods/         # 8 GPU / 80 Pods 实验输出
+│   │   ├── vgpu_dqn_sim.py          # hami-core vGPU GNN-DQN 主训练脚本
+│   │   ├── draw_vgpu_sim.py         # 训练曲线绘图脚本
+│   │   └── draw_vgpu_compare.py     # 多方法对比绘图脚本
+│   ├── vgpu_gpu_generator.py        # GPU batch 生成器
+│   ├── vgpu_pod_generator.py        # Pod batch 生成器
+│   ├── vgpu_scenario_generator.py   # GPU + Pod scenario 生成器
+│   ├── data/                        # 实验数据
+│   └── outputs*/                    # 实验输出目录
 └── README.md
 ```
 
 ---
 
-## 4. 核心方法
+## 4. 核心建模方法
 
 ### 4.1 图建模
 
@@ -88,7 +273,9 @@ GPU 节点  <---- 可分配边 ---->  Pod 节点
 
 如果某个 Pod 的资源请求可以被某张 GPU 满足，则二者之间存在一条有效边。
 
-GPU 节点特征包括：
+---
+
+### 4.2 GPU 节点特征
 
 ```text
 memory_used_ratio
@@ -99,7 +286,9 @@ memory_free_ratio
 core_free_ratio
 ```
 
-Pod 节点特征包括：
+---
+
+### 4.3 Pod 节点特征
 
 ```text
 memory_demand_ratio
@@ -108,7 +297,9 @@ vgpu_number
 allocated_flag
 ```
 
-### 4.2 动作空间
+---
+
+### 4.4 动作空间
 
 每一步动作定义为：
 
@@ -118,213 +309,179 @@ action = (gpu_idx, pod_idx)
 
 含义是：将某个 Pod 分配到某张 GPU 上。
 
-### 4.3 奖励函数
+---
 
-训练过程中同时考虑调度成功率和负载均衡。
+### 4.5 负载均衡指标
 
-即时奖励：
-
-```python
-reward = 1.0 - balance_score + 0.2 * success_rate
-```
-
-终止奖励：
-
-```python
-terminal_reward = 2.0 * success_rate - balance_score
-```
-
-其中：
+当前负载均衡指标为：
 
 ```python
 balance_score = std(memory_usage) + std(core_usage)
 ```
 
-`balance_score` 越低表示 GPU 之间负载越均衡；`success_rate` 越高表示成功调度的 Pod 越多。
-
-### 4.4 Best Checkpoint 选择
-
-当前版本的 best model 选择逻辑不是简单按照训练 reward，也不是单纯按照 balance_score。
-
-当前逻辑是：
+其中：
 
 ```text
-优先选择 success_rate 更高的模型；
-当 success_rate 接近时，选择 balance_score 更低的模型。
+memory_usage = 1 - memory_free / memory_total
+core_usage   = 1 - core_free / core_total
 ```
 
-因此当前 best model 更偏向保证较高调度成功率，同时兼顾负载均衡。
+`balance_score` 越低，说明 GPU 之间负载越均衡。
 
 ---
 
-## 5. 对比算法
+## 5. 运行方式
 
-当前实验中使用了三类策略：
-
-### 5.1 DQN
-
-使用 GNN 编码 GPU-Pod 二分图，再通过 Q 网络输出每个 `(GPU, Pod)` 动作的 Q 值，选择 Q 值最高且合法的动作。
-
-### 5.2 Least-loaded 启发式算法
-
-每次选择当前负载最低的 GPU：
-
-```text
-score = memory_used_ratio + core_used_ratio
-选择 score 最小的 GPU
-```
-
-该方法是一个简单启发式 baseline，接近 spread 思路，但不是严格等同于 Volcano 官方的 deviceshare spread 策略。
-
-### 5.3 Random
-
-从所有可分配 GPU 中随机选择一个 GPU。
-
----
-
-## 6. 运行方式
-
-### 6.1 3 GPU / 20 Pods 实验
-
-```bash
-python DQN2/algorithm/vgpu_dqn_sim.py \
-  --episodes 2000 \
-  --gpus 3 \
-  --pods 20 \
-  --lr 0.0003 \
-  --train-batches 200 \
-  --test-batches 20 \
-  --output-dir DQN2/outputs \
-  --data-dir DQN2/data/vgpu_sim \
-  --regenerate-data
-```
-
-画图：
-
-```bash
-python DQN2/algorithm/draw_vgpu_sim.py \
-  --log-path DQN2/outputs/vgpu_sim_training_log.csv \
-  --output-dir DQN2/outputs/figures \
-  --smooth-window 5
-```
-
----
-
-### 6.2 3 GPU / 30 Pods 实验
+### 5.1 固定规模实验：3GPU / 30Pods
 
 ```bash
 python DQN2/algorithm/vgpu_dqn_sim.py \
   --episodes 3000 \
   --gpus 3 \
   --pods 30 \
-  --lr 0.0003 \
   --train-batches 500 \
   --test-batches 50 \
-  --output-dir DQN2/outputs_30pods \
-  --data-dir DQN2/data/vgpu_sim_30pods \
+  --batch-size 32 \
+  --hidden-dim 128 \
+  --lr 0.0003 \
+  --success-weight 2.0 \
+  --balance-weight 1.0 \
+  --failure-weight 2.0 \
+  --output-dir DQN2/outputs_hami_3gpu_30pods \
+  --data-dir DQN2/data/hami_3gpu_30pods \
   --regenerate-data
-```
-
-画图：
-
-```bash
-python DQN2/algorithm/draw_vgpu_sim.py \
-  --log-path DQN2/outputs_30pods/vgpu_sim_training_log.csv \
-  --output-dir DQN2/outputs_30pods/figures \
-  --smooth-window 5
 ```
 
 ---
 
-### 6.3 8 GPU / 80 Pods 实验
+### 5.2 动态规模实验：3~8 GPU / 20~80 Pods
 
 ```bash
 python DQN2/algorithm/vgpu_dqn_sim.py \
   --episodes 6000 \
-  --gpus 8 \
-  --pods 80 \
-  --lr 0.0003 \
+  --min-gpus 3 \
+  --max-gpus 8 \
+  --min-pods 20 \
+  --max-pods 80 \
   --train-batches 1200 \
-  --test-batches 100 \
+  --test-batches 50 \
   --batch-size 64 \
   --hidden-dim 256 \
-  --output-dir DQN2/outputs_8gpu_80pods \
-  --data-dir DQN2/data/vgpu_sim_8gpu_80pods \
+  --lr 0.0003 \
+  --success-weight 2.0 \
+  --balance-weight 1.0 \
+  --failure-weight 2.0 \
+  --output-dir DQN2/outputs_hami_dynamic \
+  --data-dir DQN2/data/hami_dynamic \
   --regenerate-data
 ```
 
-画图：
+---
+
+## 6. 画图方式
+
+### 6.1 训练曲线
 
 ```bash
 python DQN2/algorithm/draw_vgpu_sim.py \
-  --log-path DQN2/outputs_8gpu_80pods/vgpu_sim_training_log.csv \
-  --output-dir DQN2/outputs_8gpu_80pods/figures \
+  --log-path DQN2/outputs_hami_3gpu_30pods/vgpu_sim_training_log.csv \
+  --output-dir DQN2/outputs_hami_3gpu_30pods/figures \
   --smooth-window 5
 ```
 
 ---
 
-## 7. 实验结果
+### 6.2 多方法对比图
 
-### 7.1 最终测试结果汇总
+```bash
+python DQN2/algorithm/draw_vgpu_compare.py \
+  --detail-path DQN2/outputs_hami_3gpu_30pods/test_comparison_detail.csv \
+  --summary-path DQN2/outputs_hami_3gpu_30pods/test_comparison_summary.csv \
+  --output-dir DQN2/outputs_hami_3gpu_30pods/compare_figures
+```
 
-| 场景              | 方法           | avg balance_score ↓ | avg success_rate ↑ |
-| --------------- | ------------ | ------------------: | -----------------: |
-| 3 GPU / 20 Pods | DQN          |              0.0597 |             0.9975 |
-| 3 GPU / 20 Pods | Least-loaded |              0.1311 |             0.9925 |
-| 3 GPU / 20 Pods | Random       |              0.2157 |             0.9950 |
-| 3 GPU / 30 Pods | DQN          |              0.0941 |             0.8480 |
-| 3 GPU / 30 Pods | Least-loaded |              0.1284 |             0.8180 |
-| 3 GPU / 30 Pods | Random       |              0.1384 |             0.8167 |
-| 8 GPU / 80 Pods | DQN          |              0.1440 |             0.8474 |
-| 8 GPU / 80 Pods | Least-loaded |              0.1433 |             0.8294 |
-| 8 GPU / 80 Pods | Random       |              0.1516 |             0.8238 |
+会输出：
 
----
-
-## 8. 实验分析
-
-### 8.1 3 GPU / 20 Pods
-
-在 3 GPU / 20 Pods 场景下，DQN 的平均 `balance_score` 为 `0.0597`，明显低于 Least-loaded 的 `0.1311` 和 Random 的 `0.2157`。
-
-同时，三种方法的 `success_rate` 都接近 1.0，说明该场景资源压力相对较低，主要考察的是调度后的负载均衡效果。
-
-该实验说明：在可调度性较高的场景下，DQN 能够学习到更优的 GPU-Pod 分配策略，使 GPU 间显存和算力负载更加均衡。
+```text
+avg_balance_score_bar.png
+avg_success_rate_bar.png
+avg_failure_rate_bar.png
+avg_objective_bar.png
+balance_score_test_batches.png
+success_rate_test_batches.png
+failure_rate_test_batches.png
+objective_test_batches.png
+```
 
 ---
 
-### 8.2 3 GPU / 30 Pods
+## 7. 当前样例结果：3GPU / 30Pods
 
-在 3 GPU / 30 Pods 场景下，任务压力明显增大。DQN 的平均 `balance_score` 为 `0.0941`，低于 Least-loaded 的 `0.1284` 和 Random 的 `0.1384`。
+当前一次 3GPU / 30Pods 实验结果如下：
 
-同时，DQN 的平均 `success_rate` 为 `0.8480`，也高于 Least-loaded 的 `0.8180` 和 Random 的 `0.8167`。
+| 方法              | avg_balance_score ↓ | avg_success_rate ↑ | avg_failure_rate ↓ | avg_objective ↑ |
+| --------------- | ------------------: | -----------------: | -----------------: | --------------: |
+| DQN             |              0.1858 |             0.6633 |             0.3367 |          0.4675 |
+| Random          |              0.1876 |             0.5573 |             0.4427 |          0.0418 |
+| Simple-spread   |              0.1744 |             0.5693 |             0.4307 |          0.1029 |
+| Volcano-binpack |              0.2137 |             0.5407 |             0.4593 |         -0.0510 |
+| Volcano-spread  |              0.1583 |             0.5833 |             0.4167 |          0.1750 |
 
-该实验说明：在更高负载场景下，DQN 不仅能够降低 GPU 间负载差异，还能提高 Pod 调度成功率。
+可以看出：
+
+1. DQN 的调度成功率最高。
+2. DQN 的综合 objective 最高。
+3. Volcano-spread 的纯负载均衡指标最好。
+4. DQN 在高负载场景下更偏向提高调度成功率，负载均衡效果没有完全超过 spread。
 
 ---
 
-### 8.3 8 GPU / 80 Pods
+## 8. 当前实验结论
 
-在 8 GPU / 80 Pods 的大规模场景下，DQN 的平均 `success_rate` 为 `0.8474`，高于 Least-loaded 的 `0.8294` 和 Random 的 `0.8238`。
+当前阶段可以得到以下结论：
 
-但在 `balance_score` 上，DQN 为 `0.1440`，Least-loaded 为 `0.1433`，二者基本持平，DQN 略差于 Least-loaded，但优于 Random 的 `0.1516`。
-
-该实验说明：在更大动作空间和更高资源压力下，DQN 主要优势体现在提高调度成功率；负载均衡能力与启发式方法接近，但没有明显超过 Least-loaded。
-
-因此，8 GPU / 80 Pods 更适合作为扩展性实验，说明 DQN 在大规模场景下仍具有一定调度能力，但 success_rate 和 balance_score 之间存在明显权衡。
+1. DQN 能够学习到比随机策略和简单启发式策略更高的综合调度收益。
+2. 在高负载场景下，DQN 更倾向于提高 Pod 调度成功率。
+3. Volcano-spread 在单纯负载均衡指标上较强，但调度成功率低于 DQN。
+4. Volcano-binpack 在单节点 GPU 负载均衡目标下表现较弱，因为它倾向于压实资源。
+5. 固定 Pod 数量不能完全代表调度压力，后续需要引入负载强度控制实验。
 
 ---
 
-## 9. 主要结论
+## 9. 下一步计划：负载强度控制实验
 
-当前实验可以得到以下结论：
+后续实验将引入 `target_load` 控制数据生成：
 
-1. 在 3 GPU / 20 Pods 场景下，DQN 明显提升了负载均衡效果。
-2. 在 3 GPU / 30 Pods 场景下，DQN 同时提升了调度成功率和负载均衡效果。
-3. 在 8 GPU / 80 Pods 场景下，DQN 提高了调度成功率，但负载均衡效果与 Least-loaded 基本持平。
-4. 随着规模增大，动作空间扩大，DQN 训练难度明显增加。
-5. 高负载场景下，调度成功率和负载均衡之间存在一定冲突。
+```text
+target_load = Pod 总资源需求 / GPU 总资源容量
+```
+
+计划对比：
+
+```text
+target_load = 0.6 / 0.8 / 1.0 / 1.2 / 1.5
+```
+
+每组负载强度下生成 50 个测试 batch，并比较：
+
+```text
+DQN
+Volcano-binpack
+Volcano-spread
+Simple-spread
+Random
+```
+
+重点观察：
+
+```text
+success_rate
+balance_score
+failure_rate
+objective
+```
+
+这样可以更清楚地分析不同资源压力下各调度方法的表现。
 
 ---
 
@@ -332,149 +489,154 @@ python DQN2/algorithm/draw_vgpu_sim.py \
 
 当前版本仍有以下不足：
 
-1. Least-loaded 只是简单启发式 baseline，不是严格的 Volcano 官方 binpack / spread 实现。
-2. 当前 GPU 模板固定，训练中不同 episode 使用同一组 GPU 初始资源。
-3. 当前 Pod 可以变化，但 GPU 资源配置尚未按 batch 动态生成。
-4. 当前只做单节点内 GPU 间负载均衡，没有做多节点调度。
-5. 当前一个 Pod 默认分配到一张 GPU，没有实现单 Pod 多 GPU 分配。
-6. 当前没有接入真实 Kubernetes / Volcano 调度链路。
-7. 只使用单随机种子实验，后续需要多随机种子重复实验增强稳定性。
+1. Volcano-binpack 和 Volcano-spread 是仿真 baseline，不是直接调用 Volcano 源码。
+2. 当前只研究单节点内 GPU 分配，没有研究多节点调度。
+3. 当前一个 Pod 默认分配到一张 GPU，没有实现单 Pod 多 GPU 分配。
+4. 当前尚未接入真实 Kubernetes / Volcano / HAMi 调度链路。
+5. 当前训练结果仍受随机种子和数据分布影响，后续需要多随机种子实验。
+6. 当前固定 Pod 数量实验无法严格控制负载压力，后续需要做负载强度控制实验。
 
 ---
 
-## 11. 后续工作
-
-后续可以从以下方向继续改进：
-
-### 11.1 增加 Volcano 风格 baseline
-
-将当前 Least-loaded 替换或扩展为：
-
-```text
-Volcano-binpack
-Volcano-spread
-Random
-DQN
-```
-
-其中：
-
-```text
-binpack：倾向于将任务压实到已有负载 GPU 上，减少碎片。
-spread：倾向于将任务分散到低负载 GPU 上，提高均衡性。
-```
-
-### 11.2 动态 GPU + 动态 Pod
-
-当前训练是：
-
-```text
-不同 Pod 批次 + 固定 GPU 模板
-```
-
-后续可以改为：
-
-```text
-不同 Pod 批次 + 不同 GPU 批次
-```
-
-即每个 episode 使用不同 GPU 初始配置，以增强模型对异构 GPU 环境的泛化能力。
-
-### 11.3 多目标 best checkpoint
-
-当前 best model 选择更偏向 success_rate。后续可以同时保存：
-
-```text
-best_success_model
-best_balance_model
-best_weighted_model
-```
-
-其中 weighted objective 可以定义为：
-
-```python
-eval_objective = 2.0 * eval_success_rate - eval_balance_score
-```
-
-这样可以分别分析不同优化目标下的调度行为。
-
-### 11.4 接入真实 Volcano
-
-后续可以将 DQN 策略接入真实调度流程，与 Volcano deviceshare 的 binpack / spread 策略进行真实集群对比。
-
----
-
-## 12. 结果文件说明
+## 11. 输出文件说明
 
 训练后会生成：
 
 ```text
 vgpu_sim_training_log.csv
-```
-
-其中主要字段包括：
-
-```text
-episode
-reward
-balance_score
-loss
-epsilon
-steps
-allocated_count
-success_rate
-eval_balance_score
-eval_success_rate
-best_eval_score
-best_eval_success
-```
-
-画图脚本会输出：
-
-```text
-reward_curve.png
-balance_score_curve.png
-loss_curve.png
-epsilon_curve.png
-success_rate_curve.png
-allocated_count_curve.png
-eval_balance_score_curve.png
-eval_success_rate_curve.png
-best_eval_score_curve.png
-best_eval_success_curve.png
+vgpu_dqn_sim_best.pth
+vgpu_dqn_sim_final.pth
+test_comparison_detail.csv
+test_comparison_summary.csv
 ```
 
 其中：
 
-* `reward_curve` 反映训练奖励变化。
-* `balance_score_curve` 反映训练批次上的负载均衡情况。
-* `eval_balance_score_curve` 反映固定测试集上的负载均衡效果。
-* `success_rate_curve` 反映训练批次上的调度成功率。
-* `eval_success_rate_curve` 反映固定测试集上的调度成功率。
-* `loss_curve` 只用于观察训练是否稳定，不作为最终性能指标。
-* `epsilon_curve` 反映探索率衰减过程。
+```text
+vgpu_sim_training_log.csv
+```
+
+记录训练过程中的 reward、objective、balance_score、success_rate、loss、epsilon 等信息。
+
+```text
+test_comparison_detail.csv
+```
+
+记录每个测试 batch 上每种方法的详细结果。
+
+```text
+test_comparison_summary.csv
+```
+
+记录所有测试 batch 上每种方法的平均结果。
 
 ---
 
-## 13. 注意事项
+## 12. 指标说明
 
-1. `balance_score` 越低越好。
-2. `success_rate` 越高越好。
-3. `loss` 不是最终性能指标。
-4. 训练曲线波动是正常现象，因为不同 episode 的 Pod 批次不同。
-5. 最终结论应以固定测试集上的 `eval_balance_score` 和 `eval_success_rate` 为主。
-6. 当前 best model 更偏向调度成功率，因此大规模场景下可能出现 success_rate 提升但 balance_score 不明显下降的情况。
+| 指标            | 含义           | 趋势         |
+| ------------- | ------------ | ---------- |
+| success_rate  | Pod 调度成功率    | 越高越好       |
+| failure_rate  | Pod 调度失败率    | 越低越好       |
+| balance_score | GPU 间负载不均衡程度 | 越低越好       |
+| objective     | 综合目标函数       | 越高越好       |
+| loss          | Q 网络训练损失     | 只用于观察训练稳定性 |
 
+最终方法比较应主要看：
+
+```text
+success_rate
+balance_score
+failure_rate
+objective
+```
+
+其中 `objective` 是当前版本的综合评价指标。
 EOF
 
 ````
 
-然后提交：
+---
+
+## 3. 提交当前代码和 README
+
+先看当前改动：
+
+```bash
+git status
+````
+
+如果你不想上传模型 `.pth` 和太大的实验输出，建议先只提交代码和 README：
 
 ```bash
 git add README.md
-git commit -m "Update README with vGPU DQN experiment results"
-git push origin feature/vgpu-sim-generator
-````
+git add DQN2/algorithm/vgpu_dqn_sim.py
+git add DQN2/algorithm/draw_vgpu_sim.py
+git add DQN2/algorithm/draw_vgpu_compare.py
+git add DQN2/vgpu_gpu_generator.py
+git add DQN2/vgpu_pod_generator.py
+git add DQN2/vgpu_scenario_generator.py
 
-这版 README 已经把三个实验、命令、结果表、结论和局限都写进去了。
+git commit -m "Add hami-core dynamic vGPU simulation and baseline comparison"
+```
+
+如果你还想把当前实验结果也一起提交：
+
+```bash
+git add -f DQN2/outputs_hami_3gpu_30pods/test_comparison_detail.csv
+git add -f DQN2/outputs_hami_3gpu_30pods/test_comparison_summary.csv
+git add -f DQN2/outputs_hami_3gpu_30pods/vgpu_sim_training_log.csv
+git add -f DQN2/outputs_hami_3gpu_30pods/figures/
+git add -f DQN2/outputs_hami_3gpu_30pods/compare_figures/
+
+git commit -m "Add hami-core 3GPU 30Pods experiment results"
+```
+
+不建议上传 `.pth` 模型文件，除非老师明确要求。
+
+---
+
+## 4. push 到 GitHub
+
+你之前 HTTPS push 不稳定，SSH 已经通了，所以先改 remote：
+
+```bash
+git remote set-url origin git@github.com:1Arther/vGPU-DQN.git
+git remote -v
+```
+
+确认显示：
+
+```text
+origin  git@github.com:1Arther/vGPU-DQN.git (fetch)
+origin  git@github.com:1Arther/vGPU-DQN.git (push)
+```
+
+然后推送当前分支：
+
+```bash
+CURRENT_BRANCH=$(git branch --show-current)
+git push -u origin "$CURRENT_BRANCH"
+```
+
+---
+
+## 5. 如果 commit 提示 nothing to commit
+
+说明你之前已经提交过代码，只需要 push：
+
+```bash
+CURRENT_BRANCH=$(git branch --show-current)
+git push -u origin "$CURRENT_BRANCH"
+```
+
+---
+
+## 6. 最后检查
+
+```bash
+git status
+git log --oneline -5
+```
+
+GitHub 上刷新当前分支，确认 README.md 已经变成新版说明。

@@ -1,20 +1,20 @@
 """
-vGPU GPU generator.
+hami-core vGPU GPU generator.
 
-作用：
-1. 生成单节点内的物理 GPU 资源信息；
-2. 保存 GPU 配置到 JSON；
-3. 从 JSON 加载 GPU 配置；
-4. 每轮仿真时根据模板重置 GPU 状态。
+这个文件负责生成单节点内的 GPU 资源配置。
 
-对应原项目中的 node_generator.py 思路：
-    原 node_generator.py 生成服务器节点；
-    这里生成单节点内的物理 GPU。
+新改动：
+1. 支持每个 batch 随机生成不同数量 GPU；
+2. 支持每张 GPU 随机显存容量和 core 容量；
+3. 保留 generate_gpus() 兼容旧代码；
+4. 提供 reset_gpus_from_template()，每次调度前恢复 GPU 初始状态。
 """
 
+import copy
 import json
 import os
-from typing import Dict, List
+import random
+from typing import Dict, List, Optional
 
 
 def generate_gpus(
@@ -23,15 +23,7 @@ def generate_gpus(
     core_total: int = 100,
 ) -> List[Dict]:
     """
-    生成单节点内的物理 GPU 列表。
-
-    memory_total:
-        单张 GPU 的总显存，单位 MB。
-        例如 24576 表示 24GB。
-
-    core_total:
-        抽象化的 GPU core 总量。
-        这里用 100 表示 100% 算力额度。
+    兼容旧接口：生成固定数量、同构 GPU。
     """
     gpus = []
 
@@ -51,40 +43,40 @@ def generate_gpus(
     return gpus
 
 
-def save_gpus(gpus: List[Dict], save_path: str) -> None:
+def generate_gpu_batch(
+    batch_id: int,
+    min_gpus: int = 3,
+    max_gpus: int = 8,
+    memory_choices: Optional[List[int]] = None,
+    core_choices: Optional[List[int]] = None,
+) -> List[Dict]:
     """
-    保存 GPU 配置到 JSON 文件。
+    生成一个随机 GPU batch。
+
+    新改动：
+        每个 batch 的 GPU 数量可以不同；
+        每张 GPU 的 memory/core 也可以不同。
     """
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    if memory_choices is None:
+        memory_choices = [16384, 24576, 32768]
 
-    with open(save_path, "w", encoding="utf-8") as f:
-        json.dump(gpus, f, ensure_ascii=False, indent=2)
+    if core_choices is None:
+        core_choices = [80, 100, 120]
 
+    if min_gpus <= 0 or max_gpus < min_gpus:
+        raise ValueError("invalid GPU range")
 
-def load_gpus(load_path: str) -> List[Dict]:
-    """
-    从 JSON 文件加载 GPU 配置。
-    """
-    with open(load_path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def reset_gpus_from_template(gpu_templates: List[Dict]) -> List[Dict]:
-    """
-    根据 GPU 模板重置 GPU 状态。
-
-    训练和测试时，每个 episode 都要从干净状态开始，
-    否则上一轮的资源扣减会影响下一轮。
-    """
+    num_gpus = random.randint(min_gpus, max_gpus)
     gpus = []
 
-    for gpu in gpu_templates:
-        memory_total = gpu["memory_total"]
-        core_total = gpu["core_total"]
+    for i in range(num_gpus):
+        memory_total = random.choice(memory_choices)
+        core_total = random.choice(core_choices)
 
         gpus.append(
             {
-                "gpu_id": gpu["gpu_id"],
+                "gpu_id": i,
+                "batch_id": batch_id,
                 "memory_total": memory_total,
                 "memory_free": memory_total,
                 "core_total": core_total,
@@ -97,8 +89,68 @@ def reset_gpus_from_template(gpu_templates: List[Dict]) -> List[Dict]:
     return gpus
 
 
-if __name__ == "__main__":
-    gpus = generate_gpus(num_gpus=3, memory_total=24576, core_total=100)
-    save_path = "DQN2/data/vgpu_sim/gpus_info.json"
-    save_gpus(gpus, save_path)
-    print(f"GPU data saved to: {save_path}")
+def generate_gpu_batches(
+    num_batches: int,
+    min_gpus: int = 3,
+    max_gpus: int = 8,
+    memory_choices: Optional[List[int]] = None,
+    core_choices: Optional[List[int]] = None,
+) -> List[List[Dict]]:
+    """
+    生成多个 GPU batch。
+    """
+    return [
+        generate_gpu_batch(
+            batch_id=batch_id,
+            min_gpus=min_gpus,
+            max_gpus=max_gpus,
+            memory_choices=memory_choices,
+            core_choices=core_choices,
+        )
+        for batch_id in range(num_batches)
+    ]
+
+
+def reset_gpus_from_template(gpu_templates: List[Dict]) -> List[Dict]:
+    """
+    根据 GPU 模板恢复初始状态。
+
+    注意：
+        每个 episode / 每个 baseline 测试前都必须 reset，
+        保证 DQN、binpack、spread、random 使用同一初始 GPU 状态。
+    """
+    gpus = []
+
+    for gpu in gpu_templates:
+        new_gpu = copy.deepcopy(gpu)
+        new_gpu["memory_free"] = new_gpu["memory_total"]
+        new_gpu["core_free"] = new_gpu["core_total"]
+        new_gpu["pod_count"] = 0
+        new_gpu["util"] = 0.0
+        gpus.append(new_gpu)
+
+    return gpus
+
+
+def save_gpus(gpus: List[Dict], save_path: str) -> None:
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    with open(save_path, "w", encoding="utf-8") as f:
+        json.dump(gpus, f, ensure_ascii=False, indent=2)
+
+
+def load_gpus(load_path: str) -> List[Dict]:
+    with open(load_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_gpu_batches(gpu_batches: List[List[Dict]], save_path: str) -> None:
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    with open(save_path, "w", encoding="utf-8") as f:
+        json.dump(gpu_batches, f, ensure_ascii=False, indent=2)
+
+
+def load_gpu_batches(load_path: str) -> List[List[Dict]]:
+    with open(load_path, "r", encoding="utf-8") as f:
+        return json.load(f)

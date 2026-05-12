@@ -1,14 +1,13 @@
 """
-vGPU Pod task generator.
+hami-core vGPU Pod generator.
 
-作用：
-1. 生成申请 vGPU 资源的 Pod 任务；
-2. 保存训练任务集和测试任务集；
-3. 从 JSON 加载任务集。
+这个文件负责生成 Pod 请求。
 
-对应原项目中的 task_generator.py 思路：
-    原 task_generator.py 生成普通任务；
-    这里生成申请 vGPU-memory 和 vGPU-cores 的 Pod。
+新改动：
+1. 每个 batch 的 Pod 数量可以随机；
+2. 每个 Pod 的 vgpu-memory / vgpu-cores 随机；
+3. task_id 带 batch_id，避免不同 batch 的 pod 名字重复；
+4. 当前默认 vgpu_number=1，表示单 Pod 使用一个 vGPU 切片。
 """
 
 import json
@@ -18,74 +17,77 @@ from typing import Dict, List, Optional
 
 
 def generate_pod_batch(
-    num_pods: int = 20,
+    batch_id: int,
+    min_pods: int = 20,
+    max_pods: int = 80,
     memory_choices: Optional[List[int]] = None,
     core_choices: Optional[List[int]] = None,
-    batch_id: Optional[int] = None,
+    fixed_num_pods: Optional[int] = None,
 ) -> List[Dict]:
     """
-    生成一批 Pod 任务。
+    生成一个 Pod batch。
 
-    每个 Pod 默认申请：
-        volcano.sh/vgpu-number: 1
-        volcano.sh/vgpu-memory: memory_demand
-        volcano.sh/vgpu-cores: core_demand
+    如果 fixed_num_pods 不为空，则生成固定数量 Pod；
+    否则在 [min_pods, max_pods] 内随机。
     """
     if memory_choices is None:
-        memory_choices = [1024, 2048, 3072, 4096, 5120]
+        memory_choices = [1024, 2048, 4096, 6144, 8192]
 
     if core_choices is None:
-        core_choices = [5, 10, 15]
+        core_choices = [5, 10, 15, 20, 25]
+
+    if fixed_num_pods is not None:
+        num_pods = fixed_num_pods
+    else:
+        if min_pods <= 0 or max_pods < min_pods:
+            raise ValueError("invalid Pod range")
+        num_pods = random.randint(min_pods, max_pods)
 
     pods = []
 
     for i in range(num_pods):
-        pod = {
-            "task_id": f"pod-{i}",
-            "vgpu_number": 1,
-            "memory_demand": random.choice(memory_choices),
-            "core_demand": random.choice(core_choices),
-        }
-
-        if batch_id is not None:
-            pod["batch_id"] = batch_id
-
-        pods.append(pod)
+        pods.append(
+            {
+                "task_id": f"batch-{batch_id}-pod-{i}",
+                "batch_id": batch_id,
+                "mode": "hami-core",
+                "vgpu_number": 1,
+                "memory_demand": random.choice(memory_choices),
+                "core_demand": random.choice(core_choices),
+            }
+        )
 
     return pods
 
 
 def generate_pod_batches(
-    num_batches: int = 200,
-    num_pods_per_batch: int = 20,
+    num_batches: int,
+    min_pods: int = 20,
+    max_pods: int = 80,
     memory_choices: Optional[List[int]] = None,
     core_choices: Optional[List[int]] = None,
+    num_pods_per_batch: Optional[int] = None,
 ) -> List[List[Dict]]:
     """
-    生成多批 Pod。
+    生成多个 Pod batch。
 
-    用途：
-        train_pods.json: 多批训练任务
-        test_pods.json : 多批测试任务
+    兼容旧参数 num_pods_per_batch：
+        如果传入，则每批固定 Pod 数量。
     """
-    batches = []
-
-    for batch_id in range(num_batches):
-        batch = generate_pod_batch(
-            num_pods=num_pods_per_batch,
+    return [
+        generate_pod_batch(
+            batch_id=batch_id,
+            min_pods=min_pods,
+            max_pods=max_pods,
             memory_choices=memory_choices,
             core_choices=core_choices,
-            batch_id=batch_id,
+            fixed_num_pods=num_pods_per_batch,
         )
-        batches.append(batch)
-
-    return batches
+        for batch_id in range(num_batches)
+    ]
 
 
 def save_pod_batches(pod_batches: List[List[Dict]], save_path: str) -> None:
-    """
-    保存 Pod 批次到 JSON 文件。
-    """
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
     with open(save_path, "w", encoding="utf-8") as f:
@@ -93,29 +95,5 @@ def save_pod_batches(pod_batches: List[List[Dict]], save_path: str) -> None:
 
 
 def load_pod_batches(load_path: str) -> List[List[Dict]]:
-    """
-    从 JSON 文件加载 Pod 批次。
-    """
     with open(load_path, "r", encoding="utf-8") as f:
         return json.load(f)
-
-
-if __name__ == "__main__":
-    train_batches = generate_pod_batches(
-        num_batches=200,
-        num_pods_per_batch=20,
-    )
-
-    test_batches = generate_pod_batches(
-        num_batches=20,
-        num_pods_per_batch=20,
-    )
-
-    train_path = "DQN2/data/vgpu_sim/train_pods.json"
-    test_path = "DQN2/data/vgpu_sim/test_pods.json"
-
-    save_pod_batches(train_batches, train_path)
-    save_pod_batches(test_batches, test_path)
-
-    print(f"train pods saved to: {train_path}")
-    print(f"test pods saved to : {test_path}")

@@ -1,0 +1,74 @@
+[
+  {
+    "gpu_id": 0,
+    "memory_total": 24576,
+    "memory_free": 24576,
+    "core_total": 100,
+    "core_free": 100,
+    "pod_count": 0,
+    "util": 0.0
+  },
+  {
+    "gpu_id": 1,
+    "memory_total": 24576,
+    "memory_free": 24576,
+    "core_total": 100,
+    "core_free": 100,
+    "pod_count": 0,
+    "util": 0.0
+  },
+  {
+    "gpu_id": 2,
+    "memory_total": 24576,
+    "memory_free": 24576,
+    "core_total": 100,
+    "core_free": 100,
+    "pod_count": 0,
+    "util": 0.0
+  },
+  {
+    "gpu_id": 3,
+    "memory_total": 24576,
+    "memory_free": 24576,
+    "core_total": 100,
+    "core_free": 100,
+    "pod_count": 0,
+    "util": 0.0
+  },
+  {
+    "gpu_id": 4,
+    "memory_total": 24576,
+    "memory_free": 24576,
+    "core_total": 100,
+    "core_free": 100,
+    "pod_count": 0,
+    "util": 0.0
+  },
+  {
+    "gpu_id": 5,
+    "memory_total": 24576,
+    "memory_free": 24576,
+    "core_total": 100,
+    "core_free": 100,
+    "pod_count": 0,
+    "util": 0.0
+  },
+  {
+    "gpu_id": 6,
+    "memory_total": 24576,
+    "memory_free": 24576,
+    "core_total": 100,
+    "core_free": 100,
+    "pod_count": 0,
+    "util": 0.0
+  },
+  {
+    "gpu_id": 7,
+    "memory_total": 24576,
+    "memory_free": 24576,
+    "core_total": 100,
+    "core_free": 100,
+    "pod_count": 0,
+    "util": 0.0
+  }
+]
