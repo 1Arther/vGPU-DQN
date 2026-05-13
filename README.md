@@ -1,127 +1,138 @@
-# vGPU-DQN：基于 GNN-DQN 的 hami-core vGPU 负载均衡仿真实验
+# vGPU-DQN：基于 GNN-DQN 的 Volcano vGPU 负载均衡调度仿真实验
 
 本项目研究单节点多 GPU 场景下的 vGPU 资源分配问题。实验目标是在多个 Pod 申请 vGPU 资源时，学习一个 GPU-Pod 分配策略，使调度结果同时满足：
 
-1. 尽可能提高 Pod 调度成功率；
-2. 尽可能降低 GPU 间显存与算力使用率差异；
+1. 提高 Pod 调度成功率；
+2. 降低 GPU 间显存与算力使用率差异；
 3. 在高负载和超载场景下减少资源碎片与失败 Pod 数量。
 
-当前版本是离线仿真实验代码，不直接调用 Kubernetes / Volcano API，也不会真实创建 Pod。实验主要用于对比 DQN 策略、Volcano 风格启发式策略和随机策略。
+当前版本是离线仿真实验代码，不直接调用 Kubernetes / Volcano API，也不会真实创建 Pod。实验主要用于对比 DQN 策略与 Volcano vGPU 源码风格启发式策略。
 
 ---
 
 ## 1. 当前分支主要改动
 
-本分支围绕 hami-core / Volcano vGPU 调度仿真做了如下改动：
+本分支完成了混合负载统一模型实验，并对实验流程做了规范化拆分。
 
-1. 重构 `DQN2/algorithm/vgpu_dqn_sim.py`，实现 GNN-DQN 训练、验证、测试流程。
-2. 支持按负载强度 `target_load` 生成 GPU / Pod 测试场景。
-3. DQN 和所有 baseline 使用同一批测试 batch，保证比较公平。
-4. 测试阶段关闭探索，即 DQN 使用 `epsilon = 0`。
-5. 新增综合评价指标 `objective`，同时考虑成功率、失败率和负载均衡。
-6. 新增早停机制，按验证集综合目标保存 best checkpoint。
-7. 新增 Volcano 风格 baseline：
-   - `volcano-binpack`
-   - `volcano-spread`
-   - `simple-spread`
-   - `random`
-8. 新增训练日志、测试明细、测试汇总结果输出。
-9. 新增画图脚本，用于生成训练曲线、方法对比图和负载强度趋势图。
+### 1.1 训练、测试、数据生成分离
 
----
-
-## 2. 仿真实验设定
-
-### 2.1 GPU 资源
-
-每张 GPU 记录以下资源状态：
+当前实验代码拆分为：
 
 ```text
-memory_total
-memory_free
-core_total
-core_free
-pod_count
-util
-2.2 Pod 请求
+DQN2/algorithm/vgpu_dqn_sim.py
+DQN2/algorithm/generate_vgpu_dataset.py
+DQN2/algorithm/train_vgpu_mixed_from_file.py
+DQN2/algorithm/test_vgpu_mixed_from_file.py
+DQN2/algorithm/draw_mixed_load_fixed.py
 
-每个 Pod 包含以下 vGPU 请求：
+各文件作用如下：
 
-vgpu_number
-memory_demand
-core_demand
+文件	作用
+vgpu_dqn_sim.py	公共模型、环境、reward、baseline 和评估函数
+generate_vgpu_dataset.py	提前生成固定 GPU/Pod 场景数据
+train_vgpu_mixed_from_file.py	从固定训练集读取数据并训练统一 DQN 模型
+test_vgpu_mixed_from_file.py	加载同一个 best model，在固定测试集上评估
+draw_mixed_load_fixed.py	绘制混合负载实验结果图
+2. 实验设计
+2.1 固定随机数据集
 
-当前仿真中，一个 Pod 分配到一张 GPU 上，不做跨节点拆分，也不做多节点调度。
+为了保证实验可复现，本版本不再在训练和测试时临时生成随机场景，而是先生成固定数据集：
 
-2.3 负载强度
+DQN2/data_mixed_load_fixed/
+├── dataset_meta.json
+├── train_scenarios.jsonl
+├── val_scenarios.jsonl
+├── test_load_0.6.jsonl
+├── test_load_0.8.jsonl
+├── test_load_1.0.jsonl
+├── test_load_1.2.jsonl
+└── test_load_1.5.jsonl
 
-实验使用 target_load 控制 Pod 总需求强度：
+训练、验证、测试均从上述固定文件读取。
+
+2.2 混合负载统一模型
+
+训练阶段使用混合负载：
+
+target_load = 0.6 / 0.8 / 1.0 / 1.2 / 1.5
+
+训练时只训练一个统一 DQN 模型。
+
+测试阶段使用同一个 best model 分别测试：
+
+test_load_0.6.jsonl
+test_load_0.8.jsonl
+test_load_1.0.jsonl
+test_load_1.2.jsonl
+test_load_1.5.jsonl
+
+也就是说，本实验不是每个负载强度单独训练一个模型，而是：
+
+一个混合负载训练模型 + 五组固定负载测试集
+3. 负载强度定义
+
+对每个测试场景，定义：
 
 memory_load = total_pod_memory / total_gpu_memory
 core_load   = total_pod_core   / total_gpu_core
 actual_load = max(memory_load, core_load)
 
-不同负载强度含义如下：
+不同负载强度含义：
 
-target_load = 0.6  低负载
-target_load = 0.8  中低负载
-target_load = 1.0  接近满载
-target_load = 1.2  超载
-target_load = 1.5  重度超载
-
-由于 Pod 是离散生成的，最终 actual_load 通常会略高于 target_load。
-
-3. GNN-DQN 方法
-3.1 图建模
+target_load	含义
+0.6	低负载
+0.8	中低负载
+1.0	接近满载
+1.2	超载
+1.5	重度超载
+4. GNN-DQN 建模方式
+4.1 图建模
 
 将单节点内的 GPU 和 Pod 建模为二分图：
 
 GPU 节点  <---- 可分配边 ---->  Pod 节点
 
-如果某个 Pod 的显存和 core 请求可以被某张 GPU 当前剩余资源满足，则二者之间存在一条有效边。
+如果某个 Pod 的 vGPU 显存和 core 请求可以被某张 GPU 当前剩余资源满足，则二者之间存在一条可分配边。
 
-GPU 节点特征包括：
-
+4.2 GPU 节点特征
 memory_used_ratio
 core_used_ratio
 pod_count_ratio
 util_ratio
 memory_free_ratio
 core_free_ratio
-
-Pod 节点特征包括：
-
+4.3 Pod 节点特征
 memory_demand_ratio
 core_demand_ratio
 vgpu_number
 allocated_flag
-3.2 动作空间
+4.4 动作空间
 
 每一步动作定义为：
 
 action = (gpu_idx, pod_idx)
 
-表示将某个 Pod 分配到某张 GPU 上。
+含义是将某个 Pod 分配到某张 GPU 上。
 
-3.3 评价指标
-success_rate
+5. 评价指标
+5.1 success_rate
 success_rate = allocated_pods / total_pods
 
 越高越好。
 
-failure_rate
+5.2 failure_rate
 failure_rate = 1 - success_rate
 
 越低越好。
 
-balance_score
+5.3 balance_score
 balance_score = std(memory_usage) + std(core_usage)
 
 越低表示 GPU 间负载越均衡。
 
-objective
+5.4 objective
 
-综合目标为：
+综合目标函数：
 
 objective = success_weight * success_rate
           - balance_weight * balance_score
@@ -133,241 +144,158 @@ success_weight = 2.0
 balance_weight = 1.0
 failure_weight = 2.0
 
-因此该指标同时奖励高成功率，并惩罚负载不均衡和调度失败。
+因此：
 
-4. 对比方法
-4.1 DQN
+objective 越高越好
+6. 对比方法
 
-使用 GNN 编码 GPU-Pod 二分图，通过 Q 网络选择合法动作中 Q 值最高的 (GPU, Pod) 分配。
+当前对比方法包括：
 
-4.2 Volcano-binpack
+dqn
+volcano-vgpu-binpack
+volcano-vgpu-spread
+random
+6.1 DQN
 
-模拟压实策略，倾向将 Pod 放到放置后负载更高的 GPU 上，以减少资源碎片。
+使用 GNN 编码 GPU-Pod 二分图，通过 Q 网络从合法动作中选择 Q 值最高的 GPU-Pod 分配动作。测试阶段关闭探索，即：
 
-4.3 Volcano-spread
+epsilon = 0
+6.2 volcano-vgpu-binpack
 
-模拟分散策略，倾向将 Pod 放到放置后负载更低的 GPU 上，以提高 GPU 间负载均衡。
+该 baseline 对齐 Volcano vGPU 源码中的 sortedDeviceIndicesByPolicy(binpack) 思路：
 
-4.4 Simple-spread
+UsedMem 更大的 GPU 优先；
+UsedMem 相同则 GPU index 小的优先。
 
-简单 spread baseline，只根据当前 GPU 已用负载选择较空闲 GPU。
+也就是倾向于把新的 vGPU 请求继续压入已使用显存更多的 GPU。
 
-4.5 Random
+6.3 volcano-vgpu-spread
 
-在所有可行 GPU 中随机选择。
+该 baseline 对齐 Volcano vGPU 源码中的 sortedDeviceIndicesByPolicy(spread) 思路：
 
-5. 运行方式
-5.1 单个负载强度实验
+UsedNum 更小的 GPU 优先；
+UsedNum 相同则 GPU index 小的优先。
 
-以 target_load=1.2 为例：
+也就是优先选择当前共享 Pod 数更少的 GPU，空卡优先。
 
-python DQN2/algorithm/vgpu_dqn_sim.py \
-  --episodes 3000 \
-  --gpus 3 \
-  --min-pods 1 \
-  --max-pods 200 \
-  --target-load 1.2 \
-  --train-batches 500 \
+6.4 random
+
+从所有可行 GPU 中随机选择。
+
+7. 运行方式
+7.1 生成固定数据集
+python DQN2/algorithm/generate_vgpu_dataset.py \
+  --seed 42 \
+  --output-dir DQN2/data_mixed_load_fixed \
+  --train-target-loads 0.6,0.8,1.0,1.2,1.5 \
+  --eval-loads 0.6,0.8,1.0,1.2,1.5 \
+  --train-batches 3000 \
+  --val-batches 20 \
   --test-batches 50 \
-  --batch-size 32 \
-  --hidden-dim 128 \
+  --train-min-gpus 6 \
+  --train-max-gpus 12 \
+  --train-min-pods 100 \
+  --train-max-pods 300 \
+  --test-min-gpus 8 \
+  --test-max-gpus 16 \
+  --test-min-pods 100 \
+  --test-max-pods 400
+7.2 训练统一 DQN 模型
+python DQN2/algorithm/train_vgpu_mixed_from_file.py \
+  --seed 42 \
+  --train-path DQN2/data_mixed_load_fixed/train_scenarios.jsonl \
+  --val-path DQN2/data_mixed_load_fixed/val_scenarios.jsonl \
+  --episodes 8000 \
+  --batch-size 64 \
+  --hidden-dim 256 \
   --lr 0.0003 \
   --success-weight 2.0 \
   --balance-weight 1.0 \
   --failure-weight 2.0 \
-  --early-stop-patience 10 \
-  --output-dir DQN2/outputs_load_exp/load_1.2 \
-  --data-dir DQN2/data_load_exp/load_1.2 \
-  --regenerate-data
-5.2 负载强度控制实验
-mkdir -p DQN2/outputs_load_exp
-mkdir -p DQN2/data_load_exp
-
-for LOAD in 0.6 0.8 1.0 1.2 1.5
-do
-  echo "========== Running target_load=${LOAD} =========="
-
-  python DQN2/algorithm/vgpu_dqn_sim.py \
-    --episodes 3000 \
-    --gpus 3 \
-    --min-pods 1 \
-    --max-pods 200 \
-    --target-load ${LOAD} \
-    --train-batches 500 \
-    --test-batches 50 \
-    --batch-size 32 \
-    --hidden-dim 128 \
-    --lr 0.0003 \
-    --success-weight 2.0 \
-    --balance-weight 1.0 \
-    --failure-weight 2.0 \
-    --early-stop-patience 10 \
-    --output-dir DQN2/outputs_load_exp/load_${LOAD} \
-    --data-dir DQN2/data_load_exp/load_${LOAD} \
-    --regenerate-data
-done
-
-说明：当前已完成的是“每个 target_load 单独训练一个 DQN 模型”的专用模型实验。后续更合理的主实验是使用混合负载训练一个统一 DQN 模型，然后分别在不同负载强度测试集上评估泛化能力。
-
-6. 画图方式
-6.1 单个负载强度内部对比图
-for LOAD in 0.6 0.8 1.0 1.2 1.5
-do
-  python DQN2/algorithm/draw_vgpu_compare.py \
-    --detail-path DQN2/outputs_load_exp/load_${LOAD}/test_comparison_detail.csv \
-    --summary-path DQN2/outputs_load_exp/load_${LOAD}/test_comparison_summary.csv \
-    --output-dir DQN2/outputs_load_exp/load_${LOAD}/compare_figures
-done
-6.2 训练曲线
-for LOAD in 0.6 0.8 1.0 1.2 1.5
-do
-  python DQN2/algorithm/draw_vgpu_sim.py \
-    --log-path DQN2/outputs_load_exp/load_${LOAD}/vgpu_sim_training_log.csv \
-    --output-dir DQN2/outputs_load_exp/load_${LOAD}/figures \
-    --smooth-window 5
-done
-6.3 多负载强度趋势图
-python DQN2/algorithm/collect_load_exp.py \
-  --root-dir DQN2/outputs_load_exp \
+  --early-stop-patience 20 \
+  --output-dir DQN2/outputs_mixed_load_fixed
+7.3 测试统一模型
+python DQN2/algorithm/test_vgpu_mixed_from_file.py \
+  --seed 42 \
+  --model-path DQN2/outputs_mixed_load_fixed/vgpu_dqn_mixed_best.pth \
+  --data-dir DQN2/data_mixed_load_fixed \
+  --output-dir DQN2/outputs_mixed_load_fixed_eval \
+  --eval-loads 0.6,0.8,1.0,1.2,1.5 \
+  --hidden-dim 256 \
+  --success-weight 2.0 \
+  --balance-weight 1.0 \
+  --failure-weight 2.0
+7.4 画图
+python DQN2/algorithm/draw_mixed_load_fixed.py \
+  --root-dir DQN2/outputs_mixed_load_fixed_eval \
+  --summary-path DQN2/outputs_mixed_load_fixed_eval/mixed_load_test_summary.csv \
+  --train-log DQN2/outputs_mixed_load_fixed/vgpu_mixed_training_log.csv \
   --loads 0.6,0.8,1.0,1.2,1.5 \
-  --output-dir DQN2/outputs_load_exp/summary_figures
+  --output-dir DQN2/outputs_mixed_load_fixed_eval/summary_figures \
+  --smooth-window 20
+8. 实验结果
 
-主要输出：
+测试阶段平均 GPU 数约为 11 到 12 张，平均 Pod 数约为 239 到 259 个。测试结果保存于：
 
-DQN2/outputs_load_exp/summary_figures/load_experiment_summary.csv
-DQN2/outputs_load_exp/summary_figures/avg_success_rate_vs_load.png
-DQN2/outputs_load_exp/summary_figures/avg_balance_score_vs_load.png
-DQN2/outputs_load_exp/summary_figures/avg_failure_rate_vs_load.png
-DQN2/outputs_load_exp/summary_figures/avg_objective_vs_load.png
-DQN2/outputs_load_exp/summary_figures/avg_allocated_count_vs_load.png
-7. 实验结果
-7.1 不同负载强度下 DQN 结果
-target_load	avg_actual_load	avg_memory_load	avg_core_load	DQN avg_balance_score ↓	DQN avg_success_rate ↑	DQN avg_failure_rate ↓	DQN avg_allocated_count	DQN avg_objective ↑
-0.6	0.6395	0.6091	0.5034	0.1567	1.0000	0.0000	10.34	1.8433
-0.8	0.8436	0.7998	0.7018	0.2229	0.9940	0.0060	14.46	1.7530
-1.0	1.0383	1.0117	0.8639	0.1896	0.9135	0.0865	15.94	1.4645
-1.2	1.2343	1.1920	1.0166	0.1783	0.8368	0.1632	17.18	1.1690
-1.5	1.5356	1.4947	1.2877	0.1818	0.7358	0.2642	19.30	0.7614
-7.2 target_load=0.6
+DQN2/outputs_mixed_load_fixed_eval/mixed_load_test_summary.csv
+8.1 success_rate 对比
+target_load	DQN	volcano-vgpu-binpack	volcano-vgpu-spread	random
+0.6	1.0000	1.0000	1.0000	1.0000
+0.8	1.0000	1.0000	1.0000	0.9999
+1.0	0.9491	0.9071	0.9088	0.9116
+1.2	0.8487	0.7573	0.7643	0.7706
+1.5	0.7367	0.6130	0.6215	0.6231
+8.2 balance_score 对比
+target_load	DQN	volcano-vgpu-binpack	volcano-vgpu-spread	random
+0.6	0.2193	0.8372	0.2717	0.3418
+0.8	0.2040	0.5920	0.2783	0.3177
+1.0	0.2002	0.2527	0.2482	0.2444
+1.2	0.1894	0.2553	0.2479	0.2490
+1.5	0.1722	0.2564	0.2408	0.2488
+8.3 objective 对比
+target_load	DQN	volcano-vgpu-binpack	volcano-vgpu-spread	random
+0.6	1.7807	1.1628	1.7283	1.6582
+0.8	1.7960	1.4080	1.7217	1.6817
+1.0	1.5961	1.3755	1.3871	1.4022
+1.2	1.2055	0.7738	0.8094	0.8335
+1.5	0.7745	0.1957	0.2452	0.2438
+9. 实验结论
+9.1 低负载场景
 
-低负载下所有方法 success_rate=1.0，说明资源足够。DQN 的优势主要体现在负载均衡。
+在 target_load=0.6 和 0.8 下，各方法几乎都可以完成全部 Pod 调度，success_rate 接近或达到 1.0。此时主要差异体现在 GPU 间负载均衡。
 
-method	avg_balance_score ↓	avg_success_rate ↑	avg_objective ↑
-dqn	0.1567	1.0000	1.8433
-volcano-spread	0.2202	1.0000	1.7798
-simple-spread	0.2602	1.0000	1.7398
-random	0.3930	1.0000	1.6070
-volcano-binpack	0.6433	1.0000	1.3567
+实验结果显示，DQN 在低负载下取得最低 balance_score，说明统一 DQN 模型不仅能够成功完成调度，也能够实现更均衡的 GPU 资源使用。
 
-结论：低负载场景下，DQN 能在全部调度成功的同时获得最低 balance_score。
+9.2 接近满载场景
 
-7.3 target_load=0.8
+在 target_load=1.0 下，DQN 的 success_rate 为 0.9491，高于 volcano-vgpu-binpack、volcano-vgpu-spread 和 random。同时，DQN 的 balance_score 也最低，说明 DQN 在接近满载场景下能够同时提高调度成功率和负载均衡效果。
 
-中低负载下，各方法成功率都接近 1。DQN 的 balance_score 和 objective 最优。
+9.3 超载场景
 
-method	avg_balance_score ↓	avg_success_rate ↑	avg_objective ↑
-dqn	0.2229	0.9940	1.7530
-volcano-spread	0.2281	0.9903	1.7330
-simple-spread	0.2462	0.9876	1.7041
-random	0.2913	0.9941	1.6851
-volcano-binpack	0.3483	0.9972	1.6407
+在 target_load=1.2 下，DQN 的 success_rate 为 0.8487，高于最强 baseline random 的 0.7706，平均每个测试 batch 多调度约 20.72 个 Pod。同时，DQN 的 balance_score 仍然最低，说明其没有通过牺牲负载均衡来换取成功率。
 
-结论：DQN 的成功率接近最优，且负载均衡最好，因此综合目标最高。
+9.4 重度超载场景
 
-7.4 target_load=1.0
+在 target_load=1.5 下，DQN 的 success_rate 为 0.7367，而 random、volcano-vgpu-spread 和 volcano-vgpu-binpack 分别为 0.6231、0.6215 和 0.6130。DQN 平均每个 batch 比最强 baseline 多调度约 29.80 个 Pod。
 
-接近满载时，DQN 的 balance_score 最低，objective 与 volcano-binpack 几乎持平并略高。
+这说明在资源严重不足的情况下，DQN 更会做 GPU-Pod 组合选择，能够减少资源碎片并提升可调度 Pod 数量。
 
-method	avg_balance_score ↓	avg_success_rate ↑	avg_objective ↑
-dqn	0.1896	0.9135	1.4645
-volcano-binpack	0.2224	0.9216	1.4641
-volcano-spread	0.1937	0.9074	1.4358
-simple-spread	0.2253	0.9042	1.3915
-random	0.2490	0.8998	1.3503
+10. 总体结论
 
-结论：binpack 的成功率略高，但 DQN 的负载均衡更好，综合目标略优。
+本实验表明，混合负载训练得到的统一 DQN 模型能够在不同负载强度下泛化。在低负载场景下，DQN 能够保持 100% 调度成功率并获得更低的负载不均衡；在高负载和超载场景下，DQN 相比 Volcano vGPU 源码风格 baseline 具有更高调度成功率、更低失败率和更高综合目标。
 
-7.5 target_load=1.2
+因此，DQN 在复杂高压 vGPU 调度场景下具有较好的资源分配能力。
 
-超载场景下，DQN 同时取得最高成功率、最低失败率、最低负载不均衡和最高综合目标。
-
-method	avg_balance_score ↓	avg_success_rate ↑	avg_failure_rate ↓	avg_objective ↑
-dqn	0.1783	0.8368	0.1632	1.1690
-volcano-spread	0.2027	0.7983	0.2017	0.9903
-volcano-binpack	0.2254	0.8022	0.1978	0.9835
-random	0.2204	0.7982	0.2018	0.9725
-simple-spread	0.2631	0.7848	0.2152	0.8762
-
-结论：在超载场景下，DQN 的综合调度能力明显强于启发式方法。
-
-7.6 target_load=1.5
-
-重度超载场景下，DQN 优势进一步扩大。
-
-method	avg_balance_score ↓	avg_success_rate ↑	avg_failure_rate ↓	avg_allocated_count ↑	avg_objective ↑
-dqn	0.1818	0.7358	0.2642	19.30	0.7614
-volcano-spread	0.1886	0.6802	0.3198	17.84	0.5320
-random	0.1969	0.6608	0.3392	17.30	0.4465
-simple-spread	0.2292	0.6600	0.3400	17.28	0.4107
-volcano-binpack	0.2092	0.6503	0.3497	17.02	0.3918
-
-结论：DQN 在重度超载下平均每个 batch 比最强 baseline 多调度约 1.46 个 Pod，同时保持最低 balance_score。
-
-8. 趋势分析
-
-从 0.6 到 1.5 的负载强度实验可以看到：
-
-低负载阶段，所有方法都能成功调度全部或大部分 Pod，DQN 的优势主要体现在负载均衡。
-接近满载时，启发式方法开始在成功率和负载均衡之间出现权衡，DQN 综合目标开始占优。
-超载和重度超载时，DQN 不仅成功率更高，而且 balance_score 更低，说明它没有通过牺牲均衡性来换取成功率。
-volcano-binpack 在部分场景下成功率较高，但负载不均衡较明显。
-volcano-spread 的均衡性较好，但高负载下成功率不如 DQN。
-random 和 simple-spread 在高负载下失败率明显高于 DQN。
-
-综合来看，DQN 在高负载和超载场景下优势最明显。
-
-9. 当前实验局限
-当前结果是“单负载专用模型”实验，即每个 target_load 单独训练一个 DQN 模型。
-后续应补充“混合负载统一模型”实验：用 0.6 / 0.8 / 1.0 / 1.2 / 1.5 混合训练一个模型，再分别测试不同负载强度。
-当前仍是单节点仿真，没有接入真实 Kubernetes / Volcano 调度链路。
-当前 baseline 是 Volcano 风格近似实现，不是直接调用 Volcano 源码。
-当前一个 Pod 不做跨节点拆分，也不模拟多节点调度。
-当前只展示单随机种子结果，后续需要多随机种子重复实验增强稳定性。
-10. 后续工作
-实现混合负载训练：
-train_target_loads = [0.6, 0.8, 1.0, 1.2, 1.5]
-
-训练一个统一 DQN 模型，再分别在各负载测试集上评估。
-
-支持动态 GPU 数量实验，例如：
-min_gpus = 3
-max_gpus = 8
-将 baseline 进一步贴近 Volcano deviceshare 的真实策略。
-接入真实 Volcano / HAMi 环境，做在线调度实验。
-增加多随机种子实验和置信区间。
-11. 文件输出说明
-
-每次实验输出：
-
-vgpu_sim_training_log.csv       # 训练日志
-test_comparison_detail.csv      # 50 个测试 batch 的逐批次结果
-test_comparison_summary.csv     # 各方法的平均结果
-vgpu_dqn_sim_final.pth          # 最终模型
-vgpu_dqn_sim_best.pth           # 按 objective 保存的 best 模型
-
-多负载汇总输出：
-
-load_experiment_summary.csv
-avg_success_rate_vs_load.png
-avg_balance_score_vs_load.png
-avg_failure_rate_vs_load.png
-avg_objective_vs_load.png
-avg_allocated_count_vs_load.png
-12. 注意事项
-balance_score 越低越好。
-success_rate 越高越好。
-failure_rate 越低越好。
-objective 越高越好。
-loss 只用于观察训练是否稳定，不作为最终性能指标。
-最终实验结论应以测试集上的 test_comparison_summary.csv 为准。
+11. 当前局限
+当前实验仍为单节点多 GPU 仿真，没有接入真实 Kubernetes / Volcano 调度链路。
+当前 baseline 复现的是 Volcano vGPU 选卡策略的核心排序逻辑，不包含真实系统中的所有调度细节。
+当前一个 Pod 默认分配到一张 GPU，不考虑单 Pod 跨 GPU 拆分。
+当前只使用单随机种子，后续可以增加多随机种子实验。
+当前 DQN replay 仍为逐样本训练，GPU 利用率不高，后续可进一步 batch 化优化。
+12. 后续工作
+接入真实 Volcano / HAMi 调度环境；
+扩展到多节点 GPU 调度；
+增加多随机种子实验和置信区间；
+优化 DQN replay 训练效率；
+进一步对齐 Volcano vGPU 的完整调度链路。
 EOF

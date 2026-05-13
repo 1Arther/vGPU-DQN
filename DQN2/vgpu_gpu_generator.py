@@ -1,13 +1,12 @@
 """
 hami-core vGPU GPU generator.
 
-这个文件负责生成单节点内的 GPU 资源配置。
+用于生成单节点内的 GPU 资源配置。
 
-新改动：
+新增改动：
 1. 支持每个 batch 随机生成不同数量 GPU；
-2. 支持每张 GPU 随机显存容量和 core 容量；
-3. 保留 generate_gpus() 兼容旧代码；
-4. 提供 reset_gpus_from_template()，每次调度前恢复 GPU 初始状态。
+2. 支持 GPU 显存和 core 异构；
+3. 提供 reset_gpus_from_template()，保证 DQN 和 baseline 使用同一初始 GPU 状态。
 """
 
 import copy
@@ -57,10 +56,10 @@ def generate_gpu_batch(
         每个 batch 的 GPU 数量可以不同；
         每张 GPU 的 memory/core 也可以不同。
     """
-    if memory_choices is None:
+    if memory_choices is None or len(memory_choices) == 0:
         memory_choices = [16384, 24576, 32768]
 
-    if core_choices is None:
+    if core_choices is None or len(core_choices) == 0:
         core_choices = [80, 100, 120]
 
     if min_gpus <= 0 or max_gpus < min_gpus:
@@ -89,35 +88,12 @@ def generate_gpu_batch(
     return gpus
 
 
-def generate_gpu_batches(
-    num_batches: int,
-    min_gpus: int = 3,
-    max_gpus: int = 8,
-    memory_choices: Optional[List[int]] = None,
-    core_choices: Optional[List[int]] = None,
-) -> List[List[Dict]]:
-    """
-    生成多个 GPU batch。
-    """
-    return [
-        generate_gpu_batch(
-            batch_id=batch_id,
-            min_gpus=min_gpus,
-            max_gpus=max_gpus,
-            memory_choices=memory_choices,
-            core_choices=core_choices,
-        )
-        for batch_id in range(num_batches)
-    ]
-
-
 def reset_gpus_from_template(gpu_templates: List[Dict]) -> List[Dict]:
     """
-    根据 GPU 模板恢复初始状态。
+    从 GPU 模板恢复初始状态。
 
-    注意：
-        每个 episode / 每个 baseline 测试前都必须 reset，
-        保证 DQN、binpack、spread、random 使用同一初始 GPU 状态。
+    每个 episode / 每个 baseline 测试前都必须 reset，
+    保证不同方法使用同一个初始场景。
     """
     gpus = []
 
@@ -140,17 +116,5 @@ def save_gpus(gpus: List[Dict], save_path: str) -> None:
 
 
 def load_gpus(load_path: str) -> List[Dict]:
-    with open(load_path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def save_gpu_batches(gpu_batches: List[List[Dict]], save_path: str) -> None:
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-
-    with open(save_path, "w", encoding="utf-8") as f:
-        json.dump(gpu_batches, f, ensure_ascii=False, indent=2)
-
-
-def load_gpu_batches(load_path: str) -> List[List[Dict]]:
     with open(load_path, "r", encoding="utf-8") as f:
         return json.load(f)

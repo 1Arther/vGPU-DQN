@@ -1,13 +1,12 @@
 """
 hami-core vGPU Pod generator.
 
-这个文件负责生成 Pod 请求。
+用于生成 Pod 任务请求。
 
-新改动：
-1. 每个 batch 的 Pod 数量可以随机；
-2. 每个 Pod 的 vgpu-memory / vgpu-cores 随机；
-3. task_id 带 batch_id，避免不同 batch 的 pod 名字重复；
-4. 当前默认 vgpu_number=1，表示单 Pod 使用一个 vGPU 切片。
+新增改动：
+1. 支持普通随机 Pod batch；
+2. 支持按 target_load 生成 Pod batch；
+3. target_load 用于实验 3：负载强度控制实验。
 """
 
 import json
@@ -22,27 +21,20 @@ def generate_pod_batch(
     max_pods: int = 80,
     memory_choices: Optional[List[int]] = None,
     core_choices: Optional[List[int]] = None,
-    fixed_num_pods: Optional[int] = None,
 ) -> List[Dict]:
     """
-    生成一个 Pod batch。
-
-    如果 fixed_num_pods 不为空，则生成固定数量 Pod；
-    否则在 [min_pods, max_pods] 内随机。
+    普通随机 Pod batch。
     """
-    if memory_choices is None:
+    if memory_choices is None or len(memory_choices) == 0:
         memory_choices = [1024, 2048, 4096, 6144, 8192]
 
-    if core_choices is None:
+    if core_choices is None or len(core_choices) == 0:
         core_choices = [5, 10, 15, 20, 25]
 
-    if fixed_num_pods is not None:
-        num_pods = fixed_num_pods
-    else:
-        if min_pods <= 0 or max_pods < min_pods:
-            raise ValueError("invalid Pod range")
-        num_pods = random.randint(min_pods, max_pods)
+    if min_pods <= 0 or max_pods < min_pods:
+        raise ValueError("invalid Pod range")
 
+    num_pods = random.randint(min_pods, max_pods)
     pods = []
 
     for i in range(num_pods):
@@ -60,31 +52,80 @@ def generate_pod_batch(
     return pods
 
 
-def generate_pod_batches(
-    num_batches: int,
-    min_pods: int = 20,
-    max_pods: int = 80,
+def generate_pod_batch_by_target_load(
+    batch_id: int,
+    gpus: List[Dict],
+    target_load: float,
+    min_pods: int = 1,
+    max_pods: int = 200,
     memory_choices: Optional[List[int]] = None,
     core_choices: Optional[List[int]] = None,
-    num_pods_per_batch: Optional[int] = None,
-) -> List[List[Dict]]:
+) -> List[Dict]:
     """
-    生成多个 Pod batch。
+    按目标负载强度生成 Pod。
 
-    兼容旧参数 num_pods_per_batch：
-        如果传入，则每批固定 Pod 数量。
+    target_load 定义：
+        max(total_pod_memory / total_gpu_memory,
+            total_pod_core / total_gpu_core)
+
+    例如：
+        target_load = 0.8 表示 Pod 总需求大约达到 GPU 总资源的 80%
+        target_load = 1.2 表示轻度超载
+        target_load = 1.5 表示重度超载
+
+    注意：
+        因为 Pod 是离散生成的，最终 actual_load 会略高于 target_load。
     """
-    return [
-        generate_pod_batch(
+    if target_load <= 0:
+        return generate_pod_batch(
             batch_id=batch_id,
             min_pods=min_pods,
             max_pods=max_pods,
             memory_choices=memory_choices,
             core_choices=core_choices,
-            fixed_num_pods=num_pods_per_batch,
         )
-        for batch_id in range(num_batches)
-    ]
+
+    if memory_choices is None or len(memory_choices) == 0:
+        memory_choices = [1024, 2048, 4096, 6144, 8192]
+
+    if core_choices is None or len(core_choices) == 0:
+        core_choices = [5, 10, 15, 20, 25]
+
+    if min_pods <= 0 or max_pods < min_pods:
+        raise ValueError("invalid Pod range")
+
+    total_gpu_memory = sum(gpu["memory_total"] for gpu in gpus)
+    total_gpu_core = sum(gpu["core_total"] for gpu in gpus)
+
+    pods = []
+    total_pod_memory = 0
+    total_pod_core = 0
+
+    while len(pods) < max_pods:
+        memory_demand = random.choice(memory_choices)
+        core_demand = random.choice(core_choices)
+
+        pod = {
+            "task_id": f"batch-{batch_id}-pod-{len(pods)}",
+            "batch_id": batch_id,
+            "mode": "hami-core",
+            "vgpu_number": 1,
+            "memory_demand": memory_demand,
+            "core_demand": core_demand,
+        }
+
+        pods.append(pod)
+        total_pod_memory += memory_demand
+        total_pod_core += core_demand
+
+        memory_load = total_pod_memory / total_gpu_memory
+        core_load = total_pod_core / total_gpu_core
+        dominant_load = max(memory_load, core_load)
+
+        if len(pods) >= min_pods and dominant_load >= target_load:
+            break
+
+    return pods
 
 
 def save_pod_batches(pod_batches: List[List[Dict]], save_path: str) -> None:
