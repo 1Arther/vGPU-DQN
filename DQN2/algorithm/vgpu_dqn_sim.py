@@ -1,28 +1,25 @@
 """
 Common module for vGPU-DQN mixed-load experiments.
 
-This file contains:
-1. Scenario generation utilities.
-2. GNN-DQN model.
-3. vGPU scheduling environment.
-4. Volcano vGPU source-aligned baselines.
-5. Evaluation / CSV utilities.
-
-Important:
-    This file is now a common library.
-    Use these scripts to run experiments:
-
-    1. generate_vgpu_dataset.py
-    2. train_vgpu_mixed_from_file.py
-    3. test_vgpu_mixed_from_file.py
+v5 features:
+1. Support one Pod requesting multiple vGPUs.
+2. One Pod can be allocated to multiple GPUs inside the same single node.
+3. Cross-node scheduling is not considered.
+4. Multi-vGPU allocation is all-or-nothing.
+5. Volcano vGPU baselines follow source-level device priority:
+   - volcano-vgpu-binpack: UsedMem larger first, then GPU index smaller first.
+   - volcano-vgpu-spread : UsedNum smaller first, then GPU index smaller first.
+6. DQN action remains (gpu_idx, pod_idx):
+   - gpu_idx is treated as anchor GPU.
+   - If pod.vgpu_number > 1, the simulator completes the remaining GPU set.
 """
 
 import copy
 import csv
 import json
-import math
 import os
 import random
+from itertools import combinations
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -79,7 +76,7 @@ def write_csv(rows: List[Dict], path: str):
     ensure_dir(os.path.dirname(path))
 
     if not rows:
-        with open(path, "w", newline="", encoding="utf-8") as f:
+        with open(path, "w", newline="", encoding="utf-8"):
             pass
         return
 
@@ -159,34 +156,78 @@ def generate_gpus(
     return gpus
 
 
-def _scaled_demands(
+def sample_vgpu_numbers(num_pods: int, max_vgpu_per_pod: int) -> List[int]:
+    """
+    Generate vgpu_number for each Pod.
+
+    Most Pods request 1 vGPU, and a smaller portion request multiple vGPUs.
+
+    Default approximate distribution:
+        1 vGPU: 70%
+        2 vGPU: 20%
+        3 vGPU:  7%
+        4 vGPU:  3%
+    """
+    max_vgpu_per_pod = max(1, int(max_vgpu_per_pod))
+
+    choices = [1]
+    weights = [0.70]
+
+    if max_vgpu_per_pod >= 2:
+        choices.append(2)
+        weights.append(0.20)
+
+    if max_vgpu_per_pod >= 3:
+        choices.append(3)
+        weights.append(0.07)
+
+    if max_vgpu_per_pod >= 4:
+        choices.append(4)
+        weights.append(0.03)
+
+    return random.choices(choices, weights=weights, k=num_pods)
+
+
+def _scaled_weighted_demands(
     total_target: float,
-    count: int,
+    weights: np.ndarray,
     min_value: float,
     max_value: float,
 ) -> np.ndarray:
     """
-    Generate positive values whose sum is close to total_target.
+    Generate per-vGPU demand values.
 
-    Values are clipped into [min_value, max_value].
+    The weighted sum is close to total_target:
+
+        sum(weights[i] * values[i]) ~= total_target
+
+    Here weights[i] is pod.vgpu_number.
     """
+    count = len(weights)
+
     if count <= 0:
         return np.array([], dtype=np.float32)
 
-    feasible_min_total = min_value * count
-    feasible_max_total = max_value * count
-    total_target = max(feasible_min_total, min(total_target, feasible_max_total))
+    weights = weights.astype(np.float32)
 
-    weights = np.random.gamma(shape=2.0, scale=1.0, size=count)
-    weights = weights / max(weights.sum(), 1e-8)
+    feasible_min_total = float(np.sum(weights * min_value))
+    feasible_max_total = float(np.sum(weights * max_value))
+    total_target = max(feasible_min_total, min(float(total_target), feasible_max_total))
 
-    values = weights * total_target
+    values = np.random.gamma(shape=2.0, scale=1.0, size=count).astype(np.float32)
+    values = min_value + (values / max(values.max(), 1e-8)) * (max_value - min_value)
 
-    for _ in range(10):
+    current_total = float(np.sum(weights * values))
+
+    if current_total > 1e-8:
+        values = values * (total_target / current_total)
+
+    for _ in range(20):
         values = np.clip(values, min_value, max_value)
-        diff = total_target - values.sum()
+        current_total = float(np.sum(weights * values))
+        diff = total_target - current_total
 
-        if abs(diff) < 1e-6:
+        if abs(diff) < 1e-5:
             break
 
         if diff > 0:
@@ -197,10 +238,12 @@ def _scaled_demands(
         if not np.any(mask):
             break
 
-        if abs(values[mask].sum()) < 1e-8:
-            values[mask] += diff / max(mask.sum(), 1)
-        else:
-            values[mask] += diff * values[mask] / values[mask].sum()
+        weight_sum = float(np.sum(weights[mask]))
+
+        if weight_sum <= 1e-8:
+            break
+
+        values[mask] += diff / weight_sum
 
     return np.clip(values, min_value, max_value).astype(np.float32)
 
@@ -215,9 +258,14 @@ def generate_pods_for_load(
     """
     Generate Pods according to target_load.
 
-    target_load roughly controls:
-        total_pod_memory / total_gpu_memory
-        total_pod_core   / total_gpu_core
+    v5 semantics:
+        vgpu_number   = number of vGPUs requested by this Pod.
+        memory_demand = memory demand per vGPU.
+        core_demand   = core demand per vGPU.
+
+    Total Pod demand:
+        total_memory = vgpu_number * memory_demand
+        total_core   = vgpu_number * core_demand
     """
     num_pods = random.randint(min_pods, max_pods)
 
@@ -227,19 +275,23 @@ def generate_pods_for_load(
     max_gpu_memory = max(g["memory_total"] for g in gpus)
     max_gpu_core = max(g["core_total"] for g in gpus)
 
+    max_vgpu_per_pod = min(4, len(gpus))
+    vgpu_numbers = sample_vgpu_numbers(num_pods, max_vgpu_per_pod=max_vgpu_per_pod)
+    vgpu_weights = np.array(vgpu_numbers, dtype=np.float32)
+
     memory_target = total_gpu_memory * target_load * random.uniform(0.97, 1.05)
     core_target = total_gpu_core * target_load * random.uniform(0.92, 1.04)
 
-    memory_demands = _scaled_demands(
+    memory_demands = _scaled_weighted_demands(
         total_target=memory_target,
-        count=num_pods,
+        weights=vgpu_weights,
         min_value=0.20,
         max_value=max_gpu_memory * 0.45,
     )
 
-    core_demands = _scaled_demands(
+    core_demands = _scaled_weighted_demands(
         total_target=core_target,
-        count=num_pods,
+        weights=vgpu_weights,
         min_value=0.80,
         max_value=max_gpu_core * 0.45,
     )
@@ -247,19 +299,12 @@ def generate_pods_for_load(
     pods = []
 
     for i in range(num_pods):
-        memory_demand = float(memory_demands[i])
-        core_demand = float(core_demands[i])
-
-        # vgpu_number is kept for compatibility with vGPU resource format.
-        # In this simulator, each Pod is placed on one GPU.
-        vgpu_number = max(1, int(math.ceil(core_demand / 25.0)))
-
         pods.append(
             {
                 "task_id": f"{scenario_id}-pod-{i}",
-                "vgpu_number": vgpu_number,
-                "memory_demand": round(memory_demand, 4),
-                "core_demand": round(core_demand, 4),
+                "vgpu_number": int(vgpu_numbers[i]),
+                "memory_demand": round(float(memory_demands[i]), 4),
+                "core_demand": round(float(core_demands[i]), 4),
             }
         )
 
@@ -295,37 +340,50 @@ def generate_scenario(
         scenario_id=scenario_id,
     )
 
-    actual_load, memory_load, core_load = compute_scenario_load(
-        {
-            "gpus": gpus,
-            "pods": pods,
-            "target_load": target_load,
-            "scenario_id": scenario_id,
-        }
-    )
-
-    return {
+    scenario = {
         "scenario_id": scenario_id,
         "target_load": target_load,
-        "actual_load": actual_load,
-        "memory_load": memory_load,
-        "core_load": core_load,
-        "num_gpus": len(gpus),
-        "num_pods": len(pods),
         "gpus": gpus,
         "pods": pods,
     }
 
+    actual_load, memory_load, core_load = compute_scenario_load(scenario)
+
+    scenario.update(
+        {
+            "actual_load": actual_load,
+            "memory_load": memory_load,
+            "core_load": core_load,
+            "num_gpus": len(gpus),
+            "num_pods": len(pods),
+        }
+    )
+
+    return scenario
+
 
 def compute_scenario_load(scenario: Dict) -> Tuple[float, float, float]:
+    """
+    v5 load calculation uses total vGPU demand.
+
+    total_pod_memory = sum(vgpu_number * memory_demand)
+    total_pod_core   = sum(vgpu_number * core_demand)
+    """
     gpus = scenario["gpus"]
     pods = scenario["pods"]
 
     total_gpu_memory = sum(g["memory_total"] for g in gpus)
     total_gpu_core = sum(g["core_total"] for g in gpus)
 
-    total_pod_memory = sum(p["memory_demand"] for p in pods)
-    total_pod_core = sum(p["core_demand"] for p in pods)
+    total_pod_memory = sum(
+        p.get("vgpu_number", 1) * p["memory_demand"]
+        for p in pods
+    )
+
+    total_pod_core = sum(
+        p.get("vgpu_number", 1) * p["core_demand"]
+        for p in pods
+    )
 
     memory_load = total_pod_memory / max(total_gpu_memory, 1e-8)
     core_load = total_pod_core / max(total_gpu_core, 1e-8)
@@ -773,17 +831,53 @@ def create_agent(args) -> GNNBasedDQNAgent:
 
 
 # ============================================================
-# 5. Environment logic
+# 5. Multi-vGPU environment logic
 # ============================================================
 
-def is_pod_allocatable(gpu: Dict, pod: Dict) -> bool:
+def get_required_vgpu_number(pod: Dict) -> int:
+    return max(1, int(pod.get("vgpu_number", 1)))
+
+
+def is_single_vgpu_fit(gpu: Dict, pod: Dict) -> bool:
     return (
         gpu["memory_free"] >= pod["memory_demand"]
         and gpu["core_free"] >= pod["core_demand"]
     )
 
 
+def get_feasible_gpus_for_pod(gpus: List[Dict], pod: Dict) -> List[int]:
+    return [
+        idx
+        for idx, gpu in enumerate(gpus)
+        if is_single_vgpu_fit(gpu, pod)
+    ]
+
+
+def is_pod_allocatable(gpu: Dict, pod: Dict) -> bool:
+    """
+    Backward-compatible single-GPU fit check.
+    """
+    return is_single_vgpu_fit(gpu, pod)
+
+
+def can_allocate_pod_multi_vgpu(
+    gpus: List[Dict],
+    pod: Dict,
+    anchor_gpu_idx: Optional[int] = None,
+) -> bool:
+    required = get_required_vgpu_number(pod)
+    feasible = get_feasible_gpus_for_pod(gpus, pod)
+
+    if anchor_gpu_idx is not None:
+        return anchor_gpu_idx in feasible and len(feasible) >= required
+
+    return len(feasible) >= required
+
+
 def update_gpu_resources(gpu: Dict, pod: Dict):
+    """
+    Allocate one vGPU slice of this Pod to one GPU.
+    """
     gpu["memory_free"] -= pod["memory_demand"]
     gpu["core_free"] -= pod["core_demand"]
     gpu["pod_count"] += 1
@@ -792,13 +886,42 @@ def update_gpu_resources(gpu: Dict, pod: Dict):
     gpu["util"] = max(0.0, min(100.0, core_used_ratio * 100.0))
 
 
-def balance_score(gpus: List[Dict]) -> float:
+def allocate_pod_to_gpus(
+    gpus: List[Dict],
+    pod: Dict,
+    selected_gpu_indices: List[int],
+):
     """
-    Lower is better.
+    Allocate one Pod to multiple GPUs.
 
-    This metric only uses memory/core resource balance.
-    pod_count is not included in balance_score.
+    selected_gpu_indices length must equal pod.vgpu_number.
+    Each selected GPU receives one vGPU slice.
+
+    All-or-nothing:
+        all fit checks are completed before resource update.
     """
+    required = get_required_vgpu_number(pod)
+
+    if len(selected_gpu_indices) != required:
+        raise ValueError(
+            f"selected GPU count {len(selected_gpu_indices)} "
+            f"does not match vgpu_number {required}"
+        )
+
+    if len(set(selected_gpu_indices)) != len(selected_gpu_indices):
+        raise ValueError(
+            "one Pod cannot allocate multiple vGPU slices to the same GPU in this simulator"
+        )
+
+    for idx in selected_gpu_indices:
+        if not is_single_vgpu_fit(gpus[idx], pod):
+            raise ValueError(f"GPU {idx} cannot fit pod {pod['task_id']}")
+
+    for idx in selected_gpu_indices:
+        update_gpu_resources(gpus[idx], pod)
+
+
+def balance_score(gpus: List[Dict]) -> float:
     memory_usages = [
         1.0 - g["memory_free"] / max(g["memory_total"], 1e-8)
         for g in gpus
@@ -812,10 +935,74 @@ def balance_score(gpus: List[Dict]) -> float:
     return float(np.std(memory_usages) + np.std(core_usages))
 
 
+def select_gpus_for_pod_by_anchor(
+    gpus: List[Dict],
+    pod: Dict,
+    anchor_gpu_idx: int,
+) -> Optional[List[int]]:
+    """
+    DQN multi-vGPU allocation helper.
+
+    DQN chooses:
+        action = (anchor_gpu_idx, pod_idx)
+
+    If this Pod needs multiple vGPUs:
+        - The anchor GPU must be included.
+        - The remaining GPUs are selected to minimize balance_score after allocation.
+        - All-or-nothing.
+    """
+    required = get_required_vgpu_number(pod)
+    feasible = get_feasible_gpus_for_pod(gpus, pod)
+
+    if anchor_gpu_idx not in feasible:
+        return None
+
+    if len(feasible) < required:
+        return None
+
+    if required == 1:
+        return [anchor_gpu_idx]
+
+    remaining = [idx for idx in feasible if idx != anchor_gpu_idx]
+    need = required - 1
+
+    best_selected = None
+    best_score = float("inf")
+    best_tie_key = None
+
+    for combo in combinations(remaining, need):
+        selected = [anchor_gpu_idx] + list(combo)
+
+        trial_gpus = copy.deepcopy(gpus)
+
+        try:
+            allocate_pod_to_gpus(trial_gpus, pod, selected)
+        except ValueError:
+            continue
+
+        score = balance_score(trial_gpus)
+        tie_key = tuple(sorted(selected))
+
+        if best_selected is None:
+            best_selected = selected
+            best_score = score
+            best_tie_key = tie_key
+        elif score < best_score - 1e-12:
+            best_selected = selected
+            best_score = score
+            best_tie_key = tie_key
+        elif abs(score - best_score) <= 1e-12 and tie_key < best_tie_key:
+            best_selected = selected
+            best_score = score
+            best_tie_key = tie_key
+
+    return best_selected
+
+
 def build_vgpu_graph(
     gpus: List[Dict],
     pods: List[Dict],
-    allocations: Dict[str, int],
+    allocations: Dict[str, List[int]],
 ):
     max_memory = max(g["memory_total"] for g in gpus)
     max_core = max(g["core_total"] for g in gpus)
@@ -851,7 +1038,7 @@ def build_vgpu_graph(
             [
                 pod["memory_demand"] / max_memory,
                 pod["core_demand"] / max_core,
-                pod["vgpu_number"] / 8.0,
+                get_required_vgpu_number(pod) / max(1.0, len(gpus)),
                 allocated_flag,
             ]
         )
@@ -863,7 +1050,11 @@ def build_vgpu_graph(
             if pod["task_id"] in allocations:
                 continue
 
-            if is_pod_allocatable(gpu, pod):
+            if is_single_vgpu_fit(gpu, pod) and can_allocate_pod_multi_vgpu(
+                gpus,
+                pod,
+                anchor_gpu_idx=i,
+            ):
                 adj[i, j] = 1.0
 
     return (
@@ -923,7 +1114,7 @@ def finalize_metrics(
     method: str,
     scenario: Dict,
     gpus: List[Dict],
-    allocations: Dict[str, int],
+    allocations: Dict[str, List[int]],
     args,
     total_reward: float = 0.0,
     steps: int = 0,
@@ -933,8 +1124,16 @@ def finalize_metrics(
     allocated_count = len(allocations)
     failure_count = total_pods - allocated_count
 
+    total_vgpu_count = sum(get_required_vgpu_number(p) for p in pods)
+    allocated_vgpu_count = sum(len(v) for v in allocations.values())
+    failure_vgpu_count = total_vgpu_count - allocated_vgpu_count
+
     success_rate = allocated_count / max(total_pods, 1)
     failure_rate = failure_count / max(total_pods, 1)
+
+    vgpu_success_rate = allocated_vgpu_count / max(total_vgpu_count, 1)
+    vgpu_failure_rate = failure_vgpu_count / max(total_vgpu_count, 1)
+
     bal = balance_score(gpus)
     objective = calculate_objective(success_rate, bal, failure_rate, args)
 
@@ -950,8 +1149,13 @@ def finalize_metrics(
         "balance_score": bal,
         "success_rate": success_rate,
         "failure_rate": failure_rate,
+        "vgpu_success_rate": vgpu_success_rate,
+        "vgpu_failure_rate": vgpu_failure_rate,
         "allocated_count": allocated_count,
         "failure_count": failure_count,
+        "allocated_vgpu_count": allocated_vgpu_count,
+        "failure_vgpu_count": failure_vgpu_count,
+        "total_vgpu_count": total_vgpu_count,
         "objective": objective,
         "num_gpus": len(scenario["gpus"]),
         "num_pods": total_pods,
@@ -969,7 +1173,7 @@ def run_one_episode(
     gpus = reset_gpus(scenario["gpus"])
     pods = copy.deepcopy(scenario["pods"])
 
-    allocations: Dict[str, int] = {}
+    allocations: Dict[str, List[int]] = {}
     total_reward = 0.0
     steps = 0
 
@@ -998,13 +1202,19 @@ def run_one_episode(
         gpu_idx, pod_idx = action
         pod = pods[pod_idx]
 
-        if not valid_mask[gpu_idx, pod_idx]:
+        selected_gpu_indices = select_gpus_for_pod_by_anchor(
+            gpus=gpus,
+            pod=pod,
+            anchor_gpu_idx=gpu_idx,
+        )
+
+        if selected_gpu_indices is None:
             reward = -5.0
             next_graph_data = graph_data
             done = True
         else:
-            update_gpu_resources(gpus[gpu_idx], pod)
-            allocations[pod["task_id"]] = gpu_idx
+            allocate_pod_to_gpus(gpus, pod, selected_gpu_indices)
+            allocations[pod["task_id"]] = selected_gpu_indices
 
             reward = calculate_step_reward(
                 gpus=gpus,
@@ -1067,61 +1277,88 @@ BASELINE_METHODS = [
 ]
 
 
+def sorted_gpu_indices_by_policy(
+    method: str,
+    gpus: List[Dict],
+) -> List[int]:
+    indices = list(range(len(gpus)))
+
+    if method == "volcano-vgpu-binpack":
+        # UsedMem larger first; if equal, lower GPU index first.
+        indices.sort(
+            key=lambda idx: (
+                -(gpus[idx]["memory_total"] - gpus[idx]["memory_free"]),
+                idx,
+            )
+        )
+        return indices
+
+    if method == "volcano-vgpu-spread":
+        # UsedNum smaller first; if equal, lower GPU index first.
+        indices.sort(
+            key=lambda idx: (
+                gpus[idx]["pod_count"],
+                idx,
+            )
+        )
+        return indices
+
+    if method == "random":
+        random.shuffle(indices)
+        return indices
+
+    raise ValueError(f"unknown baseline method: {method}")
+
+
+def select_gpus_for_pod_by_policy(
+    method: str,
+    gpus: List[Dict],
+    pod: Dict,
+) -> Optional[List[int]]:
+    """
+    Select a GPU combination for one Pod.
+
+    Volcano vGPU style:
+        1. Sort devices according to SchedulePolicy.
+        2. Scan from high priority to low priority.
+        3. If a device can fit one vGPU slice, add it.
+        4. Stop when selected count reaches pod.vgpu_number.
+        5. If not enough devices are found, allocation fails.
+
+    This is priority-ordered scanning with fit checks.
+    It is not simply taking top-N blindly.
+    """
+    required = get_required_vgpu_number(pod)
+    selected = []
+
+    for idx in sorted_gpu_indices_by_policy(method, gpus):
+        if len(selected) >= required:
+            break
+
+        if is_single_vgpu_fit(gpus[idx], pod):
+            selected.append(idx)
+
+    if len(selected) < required:
+        return None
+
+    return selected
+
+
 def select_gpu_by_baseline(
     method: str,
     gpus: List[Dict],
     pod: Dict,
 ) -> Optional[int]:
     """
-    Source-aligned Volcano vGPU baseline.
-
-    Volcano vGPU source:
-        pkg/scheduler/api/devices/nvidia/vgpu/utils.go
-
-    sortedDeviceIndicesByPolicy():
-
-    binpack:
-        UsedMem larger first.
-        If UsedMem is equal, lower GPU index first.
-
-    spread:
-        UsedNum smaller first.
-        If UsedNum is equal, lower GPU index first.
-
-    random:
-        Randomly choose from feasible GPUs.
+    Backward-compatible wrapper.
+    New multi-vGPU code should use select_gpus_for_pod_by_policy().
     """
-    candidates = [
-        idx
-        for idx, gpu in enumerate(gpus)
-        if is_pod_allocatable(gpu, pod)
-    ]
+    selected = select_gpus_for_pod_by_policy(method, gpus, pod)
 
-    if not candidates:
+    if not selected:
         return None
 
-    if method == "random":
-        return random.choice(candidates)
-
-    if method == "volcano-vgpu-binpack":
-        candidates.sort(
-            key=lambda idx: (
-                -(gpus[idx]["memory_total"] - gpus[idx]["memory_free"]),
-                idx,
-            )
-        )
-        return candidates[0]
-
-    if method == "volcano-vgpu-spread":
-        candidates.sort(
-            key=lambda idx: (
-                gpus[idx]["pod_count"],
-                idx,
-            )
-        )
-        return candidates[0]
-
-    raise ValueError(f"unknown baseline method: {method}")
+    return selected[0]
 
 
 def run_baseline(
@@ -1132,16 +1369,20 @@ def run_baseline(
     gpus = reset_gpus(scenario["gpus"])
     pods = copy.deepcopy(scenario["pods"])
 
-    allocations: Dict[str, int] = {}
+    allocations: Dict[str, List[int]] = {}
 
     for pod in pods:
-        gpu_idx = select_gpu_by_baseline(method, gpus, pod)
+        selected_gpu_indices = select_gpus_for_pod_by_policy(
+            method=method,
+            gpus=gpus,
+            pod=pod,
+        )
 
-        if gpu_idx is None:
+        if selected_gpu_indices is None:
             continue
 
-        update_gpu_resources(gpus[gpu_idx], pod)
-        allocations[pod["task_id"]] = gpu_idx
+        allocate_pod_to_gpus(gpus, pod, selected_gpu_indices)
+        allocations[pod["task_id"]] = selected_gpu_indices
 
     return finalize_metrics(
         method=method,
@@ -1184,6 +1425,8 @@ def evaluate_dqn_on_scenarios(
         "avg_balance_score": mean([r["balance_score"] for r in rows]),
         "avg_success_rate": mean([r["success_rate"] for r in rows]),
         "avg_failure_rate": mean([r["failure_rate"] for r in rows]),
+        "avg_vgpu_success_rate": mean([r["vgpu_success_rate"] for r in rows]),
+        "avg_vgpu_failure_rate": mean([r["vgpu_failure_rate"] for r in rows]),
     }
 
 
@@ -1210,8 +1453,13 @@ def summarize_detail_rows(rows: List[Dict], target_load: float) -> List[Dict]:
                 "std_success_rate": std([r["success_rate"] for r in group]),
                 "avg_failure_rate": mean([r["failure_rate"] for r in group]),
                 "std_failure_rate": std([r["failure_rate"] for r in group]),
+                "avg_vgpu_success_rate": mean([r["vgpu_success_rate"] for r in group]),
+                "avg_vgpu_failure_rate": mean([r["vgpu_failure_rate"] for r in group]),
                 "avg_allocated_count": mean([r["allocated_count"] for r in group]),
                 "avg_failure_count": mean([r["failure_count"] for r in group]),
+                "avg_allocated_vgpu_count": mean([r["allocated_vgpu_count"] for r in group]),
+                "avg_failure_vgpu_count": mean([r["failure_vgpu_count"] for r in group]),
+                "avg_total_vgpu_count": mean([r["total_vgpu_count"] for r in group]),
                 "avg_objective": mean([r["objective"] for r in group]),
                 "std_objective": std([r["objective"] for r in group]),
                 "avg_num_gpus": mean([r["num_gpus"] for r in group]),
@@ -1234,8 +1482,12 @@ def print_summary_table(summary_rows: List[Dict]):
         "avg_success_rate",
         "std_success_rate",
         "avg_failure_rate",
+        "avg_vgpu_success_rate",
+        "avg_vgpu_failure_rate",
         "avg_allocated_count",
         "avg_failure_count",
+        "avg_allocated_vgpu_count",
+        "avg_failure_vgpu_count",
         "avg_objective",
         "std_objective",
         "avg_num_gpus",
