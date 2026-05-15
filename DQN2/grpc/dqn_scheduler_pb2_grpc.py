@@ -3,9 +3,9 @@
 import grpc
 import warnings
 
-import scheduler_pb2 as scheduler__pb2
+import dqn_scheduler_pb2 as dqn__scheduler__pb2
 
-GRPC_GENERATED_VERSION = '1.69.0'
+GRPC_GENERATED_VERSION = '1.80.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -18,16 +18,15 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + f' but the generated code in scheduler_pb2_grpc.py depends on'
+        + ' but the generated code in dqn_scheduler_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
     )
 
 
-class DQNServiceStub(object):
-    """DQNService 定义
-    """
+class DQNSchedulerStub(object):
+    """Missing associated documentation comment in .proto file."""
 
     def __init__(self, channel):
         """Constructor.
@@ -35,46 +34,43 @@ class DQNServiceStub(object):
         Args:
             channel: A grpc.Channel.
         """
-        self.PredictBatch = channel.unary_unary(
-                '/dqn_inference.DQNService/PredictBatch',
-                request_serializer=scheduler__pb2.BatchInferenceRequest.SerializeToString,
-                response_deserializer=scheduler__pb2.BatchInferenceReply.FromString,
+        self.Predict = channel.unary_unary(
+                '/dqn_scheduler.DQNScheduler/Predict',
+                request_serializer=dqn__scheduler__pb2.PredictRequest.SerializeToString,
+                response_deserializer=dqn__scheduler__pb2.PredictResponse.FromString,
                 _registered_method=True)
 
 
-class DQNServiceServicer(object):
-    """DQNService 定义
-    """
+class DQNSchedulerServicer(object):
+    """Missing associated documentation comment in .proto file."""
 
-    def PredictBatch(self, request, context):
-        """一次性处理一批任务
-        """
+    def Predict(self, request, context):
+        """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
 
-def add_DQNServiceServicer_to_server(servicer, server):
+def add_DQNSchedulerServicer_to_server(servicer, server):
     rpc_method_handlers = {
-            'PredictBatch': grpc.unary_unary_rpc_method_handler(
-                    servicer.PredictBatch,
-                    request_deserializer=scheduler__pb2.BatchInferenceRequest.FromString,
-                    response_serializer=scheduler__pb2.BatchInferenceReply.SerializeToString,
+            'Predict': grpc.unary_unary_rpc_method_handler(
+                    servicer.Predict,
+                    request_deserializer=dqn__scheduler__pb2.PredictRequest.FromString,
+                    response_serializer=dqn__scheduler__pb2.PredictResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
-            'dqn_inference.DQNService', rpc_method_handlers)
+            'dqn_scheduler.DQNScheduler', rpc_method_handlers)
     server.add_generic_rpc_handlers((generic_handler,))
-    server.add_registered_method_handlers('dqn_inference.DQNService', rpc_method_handlers)
+    server.add_registered_method_handlers('dqn_scheduler.DQNScheduler', rpc_method_handlers)
 
 
  # This class is part of an EXPERIMENTAL API.
-class DQNService(object):
-    """DQNService 定义
-    """
+class DQNScheduler(object):
+    """Missing associated documentation comment in .proto file."""
 
     @staticmethod
-    def PredictBatch(request,
+    def Predict(request,
             target,
             options=(),
             channel_credentials=None,
@@ -87,9 +83,9 @@ class DQNService(object):
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/dqn_inference.DQNService/PredictBatch',
-            scheduler__pb2.BatchInferenceRequest.SerializeToString,
-            scheduler__pb2.BatchInferenceReply.FromString,
+            '/dqn_scheduler.DQNScheduler/Predict',
+            dqn__scheduler__pb2.PredictRequest.SerializeToString,
+            dqn__scheduler__pb2.PredictResponse.FromString,
             options,
             channel_credentials,
             insecure,
