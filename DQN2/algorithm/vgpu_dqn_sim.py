@@ -117,37 +117,55 @@ def generate_gpus(
     num_gpus: int,
     memory_choices: List[float],
     core_total: float,
-    heterogeneous: bool = True,
+    heterogeneous: bool = False,
 ) -> List[Dict]:
     """
     Generate GPU list.
 
-    memory_total unit:
-        GB in this simulator.
+    默认模拟真实单节点：
+    - 同一个节点内 GPU 同规格；
+    - 初始占用全部为 0。
 
-    core_total:
-        100 means full GPU compute percentage.
+    不同 scenario 可以通过 memory_choices 随机选择不同节点型号。
     """
     gpus = []
 
-    for gpu_id in range(num_gpus):
-        if heterogeneous:
+    if heterogeneous:
+        for gpu_id in range(num_gpus):
             memory_total = float(random.choice(memory_choices)) * random.uniform(0.92, 1.08)
             gpu_core_total = float(core_total) * random.uniform(0.95, 1.05)
-        else:
-            memory_total = float(memory_choices[0])
-            gpu_core_total = float(core_total)
 
-        memory_total = round(memory_total, 4)
-        gpu_core_total = round(gpu_core_total, 4)
+            memory_total = round(memory_total, 4)
+            gpu_core_total = round(gpu_core_total, 4)
 
+            gpus.append(
+                {
+                    "gpu_id": gpu_id,
+                    "memory_total": memory_total,
+                    "memory_free": memory_total,
+                    "core_total": gpu_core_total,
+                    "core_free": gpu_core_total,
+                    "pod_count": 0,
+                    "util": 0.0,
+                }
+            )
+
+        return gpus
+
+    node_memory_total = float(random.choice(memory_choices))
+    node_core_total = float(core_total)
+
+    node_memory_total = round(node_memory_total, 4)
+    node_core_total = round(node_core_total, 4)
+
+    for gpu_id in range(num_gpus):
         gpus.append(
             {
                 "gpu_id": gpu_id,
-                "memory_total": memory_total,
-                "memory_free": memory_total,
-                "core_total": gpu_core_total,
-                "core_free": gpu_core_total,
+                "memory_total": node_memory_total,
+                "memory_free": node_memory_total,
+                "core_total": node_core_total,
+                "core_free": node_core_total,
                 "pod_count": 0,
                 "util": 0.0,
             }
@@ -256,18 +274,20 @@ def generate_pods_for_load(
     scenario_id: str,
 ) -> List[Dict]:
     """
-    Generate Pods according to target_load.
+    Generate realistic Volcano vGPU job pods.
 
-    v5 semantics:
-        vgpu_number   = number of vGPUs requested by this Pod.
-        memory_demand = memory demand per vGPU.
-        core_demand   = core demand per vGPU.
-
-    Total Pod demand:
-        total_memory = vgpu_number * memory_demand
-        total_core   = vgpu_number * core_demand
+    设计目标：
+    1. 一个 scenario 表示一个 Job；
+    2. 一个 Job 内 Pod 来自少量 workload templates；
+    3. 同一个 Job 内允许不同大小 Pod 混合；
+    4. 加强 spread 的弱点：
+       - spread 只看 pod_count；
+       - 不看 memory/core 组合；
+       - 在高负载、大小 Pod 混合、多 vGPU Pod 下容易失败；
+    5. DQN 有机会通过 memory/core/vgpu_number 图特征学出更优策略。
     """
-    num_pods = random.randint(min_pods, max_pods)
+
+    num_gpus = len(gpus)
 
     total_gpu_memory = sum(g["memory_total"] for g in gpus)
     total_gpu_core = sum(g["core_total"] for g in gpus)
@@ -275,42 +295,348 @@ def generate_pods_for_load(
     max_gpu_memory = max(g["memory_total"] for g in gpus)
     max_gpu_core = max(g["core_total"] for g in gpus)
 
-    max_vgpu_per_pod = min(4, len(gpus))
-    vgpu_numbers = sample_vgpu_numbers(num_pods, max_vgpu_per_pod=max_vgpu_per_pod)
-    vgpu_weights = np.array(vgpu_numbers, dtype=np.float32)
+    # 根据负载控制 Job 规模
+    if target_load <= 0.7:
+        num_pods = random.randint(min_pods, max(min_pods, (min_pods + max_pods) // 2))
+    elif target_load <= 1.0:
+        num_pods = random.randint(min_pods, max_pods)
+    else:
+        num_pods = random.randint(max(min_pods, (min_pods + max_pods) // 2), max_pods)
 
-    memory_target = total_gpu_memory * target_load * random.uniform(0.97, 1.05)
-    core_target = total_gpu_core * target_load * random.uniform(0.92, 1.04)
+    # memory 单位自适应：
+    # 如果 GPU memory_total 很大，说明用的是 MB；
+    # 否则说明用的是 GB。
+    if max_gpu_memory > 1024:
+        memory_levels = [
+            2048,
+            4096,
+            8192,
+            12288,
+            16384,
+            24576,
+            32768,
+            40960,
+        ]
+    else:
+        memory_levels = [
+            2,
+            4,
+            8,
+            12,
+            16,
+            24,
+            32,
+            40,
+        ]
 
-    memory_demands = _scaled_weighted_demands(
-        total_target=memory_target,
-        weights=vgpu_weights,
-        min_value=0.20,
-        max_value=max_gpu_memory * 0.45,
-    )
+    # 不生成超过单卡 80% 的单 slice demand
+    memory_levels = [
+        m for m in memory_levels
+        if m <= max_gpu_memory * 0.80
+    ]
 
-    core_demands = _scaled_weighted_demands(
-        total_target=core_target,
-        weights=vgpu_weights,
-        min_value=0.80,
-        max_value=max_gpu_core * 0.45,
-    )
+    if not memory_levels:
+        memory_levels = [max_gpu_memory * 0.25]
+
+    core_levels = [10, 20, 25, 40, 50, 60, 75, 100]
+    core_levels = [
+        c for c in core_levels
+        if c <= max_gpu_core
+    ]
+
+    if not core_levels:
+        core_levels = [max_gpu_core * 0.25]
+
+    # Job 类型。
+    # 重点增加 memory/core 冲突和混合任务，让 spread 不再天然占优。
+    job_type = random.choices(
+        population=[
+            "small_inference",
+            "medium_inference",
+            "memory_heavy",
+            "core_heavy",
+            "training",
+            "distributed_training",
+            "mixed_conflict",
+            "near_infeasible",
+        ],
+        weights=[
+            0.15,
+            0.15,
+            0.15,
+            0.15,
+            0.15,
+            0.10,
+            0.20,
+            0.15,
+        ],
+        k=1,
+    )[0]
+
+    def choose_from(candidates, fallback):
+        if candidates:
+            return random.choice(candidates)
+        return random.choice(fallback)
+
+    def make_template(kind: str) -> Dict:
+        """
+        生成一种 Pod 模板。
+        memory_demand/core_demand 是 per-vGPU slice 的需求。
+        """
+
+        if kind == "small_inference":
+            vgpu_number = 1
+
+            mem_candidates = [
+                m for m in memory_levels
+                if m <= max_gpu_memory * 0.20
+            ]
+
+            core_candidates = [
+                c for c in core_levels
+                if c <= 25
+            ]
+
+            memory_demand = choose_from(mem_candidates, memory_levels)
+            core_demand = choose_from(core_candidates, core_levels)
+
+        elif kind == "medium_inference":
+            vgpu_number = 1
+
+            mem_candidates = [
+                m for m in memory_levels
+                if max_gpu_memory * 0.10 <= m <= max_gpu_memory * 0.40
+            ]
+
+            core_candidates = [
+                c for c in core_levels
+                if 20 <= c <= 50
+            ]
+
+            memory_demand = choose_from(mem_candidates, memory_levels)
+            core_demand = choose_from(core_candidates, core_levels)
+
+        elif kind == "memory_heavy":
+            # 高显存，低/中 core。
+            # spread 只看 pod_count 时，容易把高显存 Pod 放到不合适位置。
+            vgpu_number = random.choices(
+                [1, 2],
+                weights=[0.80, 0.20],
+                k=1,
+            )[0]
+            vgpu_number = min(vgpu_number, num_gpus)
+
+            mem_candidates = [
+                m for m in memory_levels
+                if m >= max_gpu_memory * 0.35
+            ]
+
+            core_candidates = [
+                c for c in core_levels
+                if c <= 40
+            ]
+
+            memory_demand = choose_from(mem_candidates, memory_levels)
+            core_demand = choose_from(core_candidates, core_levels)
+
+        elif kind == "core_heavy":
+            # 高 core，低/中显存。
+            vgpu_number = random.choices(
+                [1, 2],
+                weights=[0.85, 0.15],
+                k=1,
+            )[0]
+            vgpu_number = min(vgpu_number, num_gpus)
+
+            mem_candidates = [
+                m for m in memory_levels
+                if m <= max_gpu_memory * 0.30
+            ]
+
+            core_candidates = [
+                c for c in core_levels
+                if c >= 50
+            ]
+
+            memory_demand = choose_from(mem_candidates, memory_levels)
+            core_demand = choose_from(core_candidates, core_levels)
+
+        elif kind == "training":
+            vgpu_number = random.choices(
+                [1, 2],
+                weights=[0.65, 0.35],
+                k=1,
+            )[0]
+            vgpu_number = min(vgpu_number, num_gpus)
+
+            mem_candidates = [
+                m for m in memory_levels
+                if max_gpu_memory * 0.20 <= m <= max_gpu_memory * 0.60
+            ]
+
+            core_candidates = [
+                c for c in core_levels
+                if 40 <= c <= 100
+            ]
+
+            memory_demand = choose_from(mem_candidates, memory_levels)
+            core_demand = choose_from(core_candidates, core_levels)
+
+        elif kind == "distributed_training":
+            vgpu_number = random.choices(
+                [2, 4],
+                weights=[0.70, 0.30],
+                k=1,
+            )[0]
+            vgpu_number = min(vgpu_number, num_gpus)
+
+            mem_candidates = [
+                m for m in memory_levels
+                if max_gpu_memory * 0.15 <= m <= max_gpu_memory * 0.50
+            ]
+
+            core_candidates = [
+                c for c in core_levels
+                if 25 <= c <= 75
+            ]
+
+            memory_demand = choose_from(mem_candidates, memory_levels)
+            core_demand = choose_from(core_candidates, core_levels)
+
+        elif kind == "near_infeasible":
+            # 接近不可满足：单 slice 需求偏大。
+            # 用于训练模型在高负载时保留关键资源。
+            vgpu_number = random.choices(
+                [1, 2],
+                weights=[0.75, 0.25],
+                k=1,
+            )[0]
+            vgpu_number = min(vgpu_number, num_gpus)
+
+            mem_candidates = [
+                m for m in memory_levels
+                if m >= max_gpu_memory * 0.45
+            ]
+
+            core_candidates = [
+                c for c in core_levels
+                if c >= 60
+            ]
+
+            memory_demand = choose_from(mem_candidates, memory_levels)
+            core_demand = choose_from(core_candidates, core_levels)
+
+        else:
+            # mixed_conflict：
+            # 这里会在外面混合 memory_heavy/core_heavy/training 等模板。
+            vgpu_number = random.choices(
+                [1, 2, 4],
+                weights=[0.65, 0.25, 0.10],
+                k=1,
+            )[0]
+            vgpu_number = min(vgpu_number, num_gpus)
+
+            memory_demand = random.choice(memory_levels)
+            core_demand = random.choice(core_levels)
+
+        return {
+            "vgpu_number": int(vgpu_number),
+            "memory_demand": float(memory_demand),
+            "core_demand": float(core_demand),
+        }
+
+    # 一个 Job 里通常不是每个 Pod 都独立随机，而是来自少量模板。
+    if job_type == "mixed_conflict":
+        template_kinds = random.sample(
+            ["memory_heavy", "core_heavy", "training", "medium_inference"],
+            k=random.choice([2, 3]),
+        )
+    elif job_type == "near_infeasible":
+        # 接近不可满足场景中，也混入一些小 Pod，避免全是巨型 Pod。
+        template_kinds = ["near_infeasible", random.choice(["small_inference", "medium_inference"])]
+    else:
+        template_kinds = [job_type]
+
+        if random.random() < 0.35:
+            template_kinds.append(
+                random.choice(["small_inference", "medium_inference", "memory_heavy", "core_heavy"])
+            )
+
+    templates = [
+        make_template(kind)
+        for kind in template_kinds
+    ]
 
     pods = []
 
     for i in range(num_pods):
+        tpl = random.choice(templates)
+
         pods.append(
             {
                 "task_id": f"{scenario_id}-pod-{i}",
-                "vgpu_number": int(vgpu_numbers[i]),
-                "memory_demand": round(float(memory_demands[i]), 4),
-                "core_demand": round(float(core_demands[i]), 4),
+                "vgpu_number": int(tpl["vgpu_number"]),
+                "memory_demand": round(float(tpl["memory_demand"]), 4),
+                "core_demand": round(float(tpl["core_demand"]), 4),
             }
         )
 
-    random.shuffle(pods)
-    return pods
+    def calc_load(pod_list):
+        total_mem = sum(
+            p.get("vgpu_number", 1) * p["memory_demand"]
+            for p in pod_list
+        )
 
+        total_core = sum(
+            p.get("vgpu_number", 1) * p["core_demand"]
+            for p in pod_list
+        )
+
+        memory_load = total_mem / max(total_gpu_memory, 1e-8)
+        core_load = total_core / max(total_gpu_core, 1e-8)
+        actual_load = max(memory_load, core_load)
+
+        return actual_load, memory_load, core_load
+
+    # 控制负载落在目标附近。
+    # 高负载允许更宽，因为真实高负载 Job 本来就更容易失败。
+    if target_load <= 1.0:
+        lower = target_load * 0.80
+        upper = target_load * 1.20
+    else:
+        lower = target_load * 0.85
+        upper = target_load * 1.25
+
+    # 调整 Pod 数量，让总需求接近 target_load。
+    for _ in range(80):
+        actual_load, _, _ = calc_load(pods)
+
+        if lower <= actual_load <= upper:
+            break
+
+        if actual_load > upper and len(pods) > min_pods:
+            pods.pop(random.randrange(len(pods)))
+            continue
+
+        if actual_load < lower and len(pods) < max_pods:
+            tpl = random.choice(templates)
+            idx = len(pods)
+
+            pods.append(
+                {
+                    "task_id": f"{scenario_id}-pod-{idx}",
+                    "vgpu_number": int(tpl["vgpu_number"]),
+                    "memory_demand": round(float(tpl["memory_demand"]), 4),
+                    "core_demand": round(float(tpl["core_demand"]), 4),
+                }
+            )
+            continue
+
+        break
+
+    random.shuffle(pods)
+
+    return pods
 
 def generate_scenario(
     target_load: float,
@@ -321,7 +647,7 @@ def generate_scenario(
     gpu_memory_choices: List[float],
     gpu_core_total: float,
     scenario_id: str,
-    heterogeneous_gpus: bool = True,
+    heterogeneous_gpus: bool = False,
 ) -> Dict:
     num_gpus = random.randint(min_gpus, max_gpus)
 
@@ -1271,8 +1597,9 @@ def run_one_episode(
 # ============================================================
 
 BASELINE_METHODS = [
-    "volcano-vgpu-binpack",
-    "volcano-vgpu-spread",
+    "used-mem-desc",
+    "used-mem-asc",
+    "index-desc",
     "random",
 ]
 
@@ -1283,8 +1610,10 @@ def sorted_gpu_indices_by_policy(
 ) -> List[int]:
     indices = list(range(len(gpus)))
 
-    if method == "volcano-vgpu-binpack":
-        # UsedMem larger first; if equal, lower GPU index first.
+    if method == "used-mem-desc":
+        # 类似 binpack:
+        # 已使用显存越多，优先级越高。
+        # 目标是尽量把任务继续塞到已经使用较多的 GPU 上。
         indices.sort(
             key=lambda idx: (
                 -(gpus[idx]["memory_total"] - gpus[idx]["memory_free"]),
@@ -1293,14 +1622,27 @@ def sorted_gpu_indices_by_policy(
         )
         return indices
 
-    if method == "volcano-vgpu-spread":
-        # UsedNum smaller first; if equal, lower GPU index first.
+    if method == "used-mem-asc":
+        # 类似 spread:
+        # 已使用显存越少，优先级越高。
+        # 目标是优先选择更空闲的 GPU。
         indices.sort(
             key=lambda idx: (
-                gpus[idx]["pod_count"],
+                gpus[idx]["memory_total"] - gpus[idx]["memory_free"],
                 idx,
             )
         )
+        return indices
+
+    if method == "index-desc":
+        # 模拟 Volcano vGPU 源码中节点内设备扫描顺序：
+        # 从高索引 GPU 向低索引 GPU 依次尝试。
+        indices.sort(reverse=True)
+        return indices
+
+    if method == "index-asc":
+        # 可选：从低索引到高索引扫描。
+        indices.sort()
         return indices
 
     if method == "random":
@@ -1308,7 +1650,6 @@ def sorted_gpu_indices_by_policy(
         return indices
 
     raise ValueError(f"unknown baseline method: {method}")
-
 
 def select_gpus_for_pod_by_policy(
     method: str,
