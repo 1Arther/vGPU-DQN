@@ -5,7 +5,7 @@ import warnings
 
 import dqn_scheduler_pb2 as dqn__scheduler__pb2
 
-GRPC_GENERATED_VERSION = '1.80.0'
+GRPC_GENERATED_VERSION = '1.81.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -25,7 +25,7 @@ if _version_not_supported:
     )
 
 
-class DQNSchedulerStub(object):
+class DQNSchedulerStub:
     """Missing associated documentation comment in .proto file."""
 
     def __init__(self, channel):
@@ -39,12 +39,23 @@ class DQNSchedulerStub(object):
                 request_serializer=dqn__scheduler__pb2.PredictRequest.SerializeToString,
                 response_deserializer=dqn__scheduler__pb2.PredictResponse.FromString,
                 _registered_method=True)
+        self.ScheduleJob = channel.unary_unary(
+                '/dqn_scheduler.DQNScheduler/ScheduleJob',
+                request_serializer=dqn__scheduler__pb2.ScheduleJobRequest.SerializeToString,
+                response_deserializer=dqn__scheduler__pb2.ScheduleJobResponse.FromString,
+                _registered_method=True)
 
 
-class DQNSchedulerServicer(object):
+class DQNSchedulerServicer:
     """Missing associated documentation comment in .proto file."""
 
     def Predict(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ScheduleJob(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -58,6 +69,11 @@ def add_DQNSchedulerServicer_to_server(servicer, server):
                     request_deserializer=dqn__scheduler__pb2.PredictRequest.FromString,
                     response_serializer=dqn__scheduler__pb2.PredictResponse.SerializeToString,
             ),
+            'ScheduleJob': grpc.unary_unary_rpc_method_handler(
+                    servicer.ScheduleJob,
+                    request_deserializer=dqn__scheduler__pb2.ScheduleJobRequest.FromString,
+                    response_serializer=dqn__scheduler__pb2.ScheduleJobResponse.SerializeToString,
+            ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
             'dqn_scheduler.DQNScheduler', rpc_method_handlers)
@@ -66,7 +82,7 @@ def add_DQNSchedulerServicer_to_server(servicer, server):
 
 
  # This class is part of an EXPERIMENTAL API.
-class DQNScheduler(object):
+class DQNScheduler:
     """Missing associated documentation comment in .proto file."""
 
     @staticmethod
@@ -86,6 +102,33 @@ class DQNScheduler(object):
             '/dqn_scheduler.DQNScheduler/Predict',
             dqn__scheduler__pb2.PredictRequest.SerializeToString,
             dqn__scheduler__pb2.PredictResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ScheduleJob(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/dqn_scheduler.DQNScheduler/ScheduleJob',
+            dqn__scheduler__pb2.ScheduleJobRequest.SerializeToString,
+            dqn__scheduler__pb2.ScheduleJobResponse.FromString,
             options,
             channel_credentials,
             insecure,
