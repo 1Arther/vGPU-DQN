@@ -27,7 +27,7 @@ DQN2/
 │   ├── test_vgpu_mixed_homo_real.py
 │   ├── test_exact_4gpu_8pod_direct.py
 │   └── draw_eval_formal.py
-├── data_mixed_load_fixed_homo_real_hard/
+├── data_mixed_load_fixed_homo_real_hard_clean/
 ├── outputs_mixed_load_fixed_v9_homo_real_hard/
 ├── outputs_mixed_load_fixed_v9_homo_real_hard_eval/
 └── grpc/
@@ -78,12 +78,45 @@ dqn	使用 DQN 根据当前图状态选择 GPU 与 Pod
 
 当前阶段暂时以显存资源为主要瓶颈进行实验，core 维度后续可以继续加入更细粒度的建模和 baseline。
 
-5. 数据生成
+5. Balance 指标
+
+当前 `balance_score` 同时包含两部分：
+
+- GPU 间负载均衡：所有 GPU 的 memory 使用率标准差 + core 使用率标准差；
+- GPU 内负载均衡：每张 GPU 内部 `abs(memory_used_ratio - core_used_ratio)` 的平均值。
+
+默认权重：
+
+```text
+balance_score = inter_gpu_balance_score + intra_gpu_balance_score
+```
+
+训练和测试可通过以下参数调整：
+
+```text
+--inter-balance-weight 1.0
+--intra-balance-weight 1.0
+--delta-balance-weight 1.0
+```
+
+Reward 中额外加入每一步的 balance 改善量：
+
+```text
+balance_delta = previous_balance_score - current_balance_score
+step_reward += delta_balance_weight * balance_delta
+```
+
+模型输入也显式加入 memory/core 失衡特征：
+
+- GPU 特征包含 `abs(memory_used_ratio - core_used_ratio)` 和 `memory_used_ratio - core_used_ratio`；
+- Pod 特征包含 `abs(memory_demand_ratio - core_demand_ratio)` 和 `memory_demand_ratio - core_demand_ratio`。
+
+6. 数据生成
 
 生成更真实的随机测试数据：
 
 python DQN2/algorithm/generate_mixed_load_fixed_homogeneous.py \
-  --output-dir DQN2/data_mixed_load_fixed_homo_real_hard \
+  --output-dir DQN2/data_mixed_load_fixed_homo_real_hard_clean \
   --loads 0.6,0.8,1.0,1.2,1.5,1.8 \
   --train-per-load 800 \
   --val-per-load 120 \
@@ -97,18 +130,98 @@ python DQN2/algorithm/generate_mixed_load_fixed_homogeneous.py \
   --hard-memory-total 49152 \
   --hard-memory-demand 8192 \
   --hard-core-total 100 \
-  --hard-core-demand 25
+  --hard-core-demand 25 \
+  --hard-case-splits train \
+  --strict-actual-load \
+  --actual-load-tolerance 0.12
+
+说明：
+
+- 随机场景会按 actual_load 过滤，避免 target_load=0.6 的桶混入实际高负载样本；
+- 固定 hard case 默认只进入 train，不进入 val/test；
+- 如果需要复现实验中的旧行为，可以添加 `--hard-case-splits train val test --no-strict-actual-load`。
 
 生成结果：
 
-DQN2/data_mixed_load_fixed_homo_real_hard/
+DQN2/data_mixed_load_fixed_homo_real_hard_clean/
 ├── train_scenarios.jsonl
 ├── val_scenarios.jsonl
 └── test_scenarios.jsonl
-6. 模型训练
+
+7. Conflict 展示测试集
+
+用于单独验证 memory/core 互补调度能力。每个 Job 都混合：
+
+- 高 mem / 低 core Pod；
+- 低 mem / 高 core Pod；
+- 少量均衡 Pod。
+
+该测试集不替代 clean test，只用于展示模型在冲突型资源组合上的优势。
+
+```bash
+python DQN2/algorithm/generate_conflict_homogeneous.py \
+  --output-dir DQN2/data_conflict_homo_real \
+  --loads 0.6,0.8,1.0,1.2,1.3 \
+  --per-load 120
+```
+
+输出：
+
+```text
+DQN2/data_conflict_homo_real/conflict_test_scenarios.jsonl
+```
+
+评估：
+
+```bash
+python DQN2/algorithm/test_vgpu_mixed_homo_real.py \
+  --model-path DQN2/outputs_mixed_load_fixed_v13_homo_real_hard_clean_delta_feature/vgpu_dqn_mixed_best.pth \
+  --test-path DQN2/data_conflict_homo_real/conflict_test_scenarios.jsonl \
+  --output-dir DQN2/outputs_mixed_load_fixed_v13_conflict_eval \
+  --inter-balance-weight 1.0 \
+  --intra-balance-weight 1.0 \
+  --delta-balance-weight 2.0
+```
+
+8. 已有负载场景
+
+用于模拟非空节点和 GPU 碎片。生成器会给随机场景中的每张 GPU 注入已有
+memory/core 使用率和 pod_count，包含 balanced、memory-heavy、core-heavy
+等已有负载形态。
+
+```bash
+python DQN2/algorithm/generate_mixed_load_fixed_homogeneous.py \
+  --output-dir DQN2/data_mixed_load_preload_homo_real \
+  --loads 0.6,0.8,1.0,1.2,1.3 \
+  --train-per-load 900 \
+  --val-per-load 150 \
+  --test-per-load 150 \
+  --hard-case-splits train \
+  --enable-existing-load \
+  --existing-load-min 0.05 \
+  --existing-load-max 0.40
+```
+
+大模型训练示例：
+
+```bash
 python DQN2/algorithm/train_vgpu_mixed_job_hardcase.py \
-  --train-path DQN2/data_mixed_load_fixed_homo_real_hard/train_scenarios.jsonl \
-  --val-path DQN2/data_mixed_load_fixed_homo_real_hard/val_scenarios.jsonl \
+  --train-path DQN2/data_mixed_load_preload_homo_real/train_scenarios.jsonl \
+  --val-path DQN2/data_mixed_load_preload_homo_real/val_scenarios.jsonl \
+  --output-dir DQN2/outputs_mixed_load_preload_v14_big_delta_feature \
+  --episodes 12000 \
+  --hidden-dim 512 \
+  --batch-size 128 \
+  --buffer-size 50000 \
+  --lr 2e-4 \
+  --inter-balance-weight 1.0 \
+  --intra-balance-weight 1.0 \
+  --delta-balance-weight 2.0
+```
+9. 模型训练
+python DQN2/algorithm/train_vgpu_mixed_job_hardcase.py \
+  --train-path DQN2/data_mixed_load_fixed_homo_real_hard_clean/train_scenarios.jsonl \
+  --val-path DQN2/data_mixed_load_fixed_homo_real_hard_clean/val_scenarios.jsonl \
   --output-dir DQN2/outputs_mixed_load_fixed_v9_homo_real_hard \
   --episodes 10000 \
   --hard-case-repeat 20 \
@@ -124,7 +237,7 @@ DQN2/outputs_mixed_load_fixed_v9_homo_real_hard/
 ├── vgpu_dqn_mixed_final.pth
 ├── train_args.json
 └── vgpu_mixed_training_log.csv
-7. 固定场景测试
+10. 固定场景测试
 
 用于验证模型在简单规整场景下的行为。
 
@@ -147,10 +260,10 @@ python DQN2/algorithm/test_exact_4gpu_8pod_direct.py \
 理想分配结果：
 
 final distribution: [2, 2, 2, 2]
-8. 测试集评估
+11. 测试集评估
 python DQN2/algorithm/test_vgpu_mixed_homo_real.py \
   --model-path DQN2/outputs_mixed_load_fixed_v9_homo_real_hard/vgpu_dqn_mixed_best.pth \
-  --test-path DQN2/data_mixed_load_fixed_homo_real_hard/test_scenarios.jsonl \
+  --test-path DQN2/data_mixed_load_fixed_homo_real_hard_clean/test_scenarios.jsonl \
   --output-dir DQN2/outputs_mixed_load_fixed_v9_homo_real_hard_eval
 
 输出：
@@ -159,7 +272,7 @@ DQN2/outputs_mixed_load_fixed_v9_homo_real_hard_eval/
 ├── mixed_load_test_detail.csv
 ├── mixed_load_test_summary.csv
 └── test_args.json
-9. 绘制实验图
+12. 绘制实验图
 
 过滤 hard case，只保留随机测试负载：
 
@@ -182,7 +295,7 @@ DQN2/outputs_mixed_load_fixed_v9_homo_real_hard_eval/formal_figures/
 ├── avg_vgpu_success_rate.png
 ├── random_load_summary.csv
 └── hard_case_detail_table.csv
-10. 当前实验结论
+13. 当前实验结论
 
 当前结果表明：
 
@@ -195,7 +308,7 @@ used-mem-asc 是当前最强的显存启发式 baseline，DQN 的优势主要体
 简要结论：
 
 DQN 并非在所有负载下碾压启发式方法，但在高负载和复杂 Pod 组合下表现出更好的接纳能力和更低的失败率。
-11. 后续工作
+14. 后续工作
 
 后续可以继续完善：
 

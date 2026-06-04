@@ -59,13 +59,14 @@ except ModuleNotFoundError:
     )
 
 
-def infer_load_bucket(scenario):
+def infer_actual_load_bucket(scenario):
     """
-    优先用 target_load。
-    hard case 的 target_load 可能是 0.5 之类，不属于 0.6/0.8/...
-    这里统一保留一位小数作为分组。
+    Group evaluation by actual demand pressure, not requested target_load.
+
+    Some generated scenarios miss their target load, so target_load buckets can
+    make low-load curves include high-pressure samples.
     """
-    load = scenario.get("target_load", scenario.get("actual_load", 0.0))
+    load = scenario.get("actual_load", scenario.get("target_load", 0.0))
 
     try:
         load = float(load)
@@ -90,7 +91,7 @@ def evaluate_scenarios(agent, scenarios, args):
         )
 
         dqn_row["batch_id"] = batch_id
-        dqn_row["load_bucket"] = infer_load_bucket(scenario)
+        dqn_row["load_bucket"] = infer_actual_load_bucket(scenario)
         detail_rows.append(dqn_row)
 
         for method in BASELINE_METHODS:
@@ -101,7 +102,7 @@ def evaluate_scenarios(agent, scenarios, args):
             )
 
             baseline_row["batch_id"] = batch_id
-            baseline_row["load_bucket"] = infer_load_bucket(scenario)
+            baseline_row["load_bucket"] = infer_actual_load_bucket(scenario)
             detail_rows.append(baseline_row)
 
     agent.epsilon = old_epsilon
@@ -156,6 +157,7 @@ def main():
     )
 
     parser.add_argument("--hidden-dim", type=int, default=256)
+    parser.add_argument("--disable-job-features", action="store_true")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--gamma", type=float, default=0.9)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -168,7 +170,18 @@ def main():
 
     parser.add_argument("--success-weight", type=float, default=2.0)
     parser.add_argument("--balance-weight", type=float, default=1.0)
+    parser.add_argument("--inter-balance-weight", type=float, default=1.0)
+    parser.add_argument("--intra-balance-weight", type=float, default=1.0)
+    parser.add_argument("--delta-balance-weight", type=float, default=1.0)
+    parser.add_argument("--delta-inter-balance-weight", type=float, default=None)
+    parser.add_argument("--delta-intra-balance-weight", type=float, default=None)
     parser.add_argument("--failure-weight", type=float, default=2.0)
+    parser.add_argument("--action-rerank-topk", type=int, default=0)
+    parser.add_argument("--action-rerank-q-weight", type=float, default=1.0)
+    parser.add_argument("--action-rerank-balance-weight", type=float, default=1.0)
+    parser.add_argument("--action-rerank-inter-weight", type=float, default=0.0)
+    parser.add_argument("--action-rerank-intra-weight", type=float, default=0.0)
+    parser.add_argument("--train-action-rerank", action="store_true")
 
     args = parser.parse_args()
 

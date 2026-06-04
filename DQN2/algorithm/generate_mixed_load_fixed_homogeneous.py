@@ -30,12 +30,14 @@ python DQN2/algorithm/generate_mixed_load_fixed_homogeneous.py \
 import argparse
 import copy
 import os
+import random
 import sys
 from pathlib import Path
 from typing import Dict, List
 
 try:
     from DQN2.algorithm.vgpu_dqn_sim import (
+        compute_scenario_load,
         ensure_dir,
         generate_scenario,
         seed_everything,
@@ -46,6 +48,7 @@ except ModuleNotFoundError:
     sys.path.append(str(project_root))
 
     from DQN2.algorithm.vgpu_dqn_sim import (
+        compute_scenario_load,
         ensure_dir,
         generate_scenario,
         seed_everything,
@@ -119,6 +122,193 @@ def build_exact_job_scenario(
         "gpus": gpus,
         "pods": pods,
     }
+
+
+def apply_existing_load(scenario: Dict, args) -> Dict:
+    """
+    Add pre-existing GPU load to simulate non-empty nodes and fragmentation.
+
+    The Job demand loads remain stored as memory_load/core_load/actual_load.
+    Existing load is stored separately so target load still describes the
+    incoming Job pressure.
+    """
+    if not args.enable_existing_load:
+        scenario["existing_memory_load"] = 0.0
+        scenario["existing_core_load"] = 0.0
+        return scenario
+
+    gpus = scenario["gpus"]
+    memory_used_ratios = []
+    core_used_ratios = []
+
+    for gpu in gpus:
+        profile = random.choices(
+            ["balanced", "memory_heavy", "core_heavy", "light"],
+            weights=[
+                args.existing_balanced_ratio,
+                args.existing_memory_heavy_ratio,
+                args.existing_core_heavy_ratio,
+                args.existing_light_ratio,
+            ],
+            k=1,
+        )[0]
+
+        base = random.uniform(args.existing_load_min, args.existing_load_max)
+
+        if profile == "memory_heavy":
+            memory_used = min(args.existing_load_max, base * random.uniform(1.20, 1.55))
+            core_used = max(args.existing_load_min * 0.5, base * random.uniform(0.25, 0.65))
+        elif profile == "core_heavy":
+            memory_used = max(args.existing_load_min * 0.5, base * random.uniform(0.25, 0.65))
+            core_used = min(args.existing_load_max, base * random.uniform(1.20, 1.55))
+        elif profile == "light":
+            memory_used = base * random.uniform(0.20, 0.55)
+            core_used = base * random.uniform(0.20, 0.55)
+        else:
+            memory_used = base * random.uniform(0.80, 1.20)
+            core_used = base * random.uniform(0.80, 1.20)
+
+        memory_used = max(0.0, min(args.existing_load_max, memory_used))
+        core_used = max(0.0, min(args.existing_load_max, core_used))
+
+        gpu["memory_free"] = max(
+            0.0,
+            gpu["memory_total"] * (1.0 - memory_used),
+        )
+        gpu["core_free"] = max(
+            0.0,
+            gpu["core_total"] * (1.0 - core_used),
+        )
+        gpu["pod_count"] = random.randint(
+            args.existing_pod_count_min,
+            args.existing_pod_count_max,
+        )
+        gpu["util"] = max(0.0, min(100.0, core_used * 100.0))
+
+        memory_used_ratios.append(memory_used)
+        core_used_ratios.append(core_used)
+
+    scenario["existing_memory_load"] = float(sum(memory_used_ratios) / max(len(gpus), 1))
+    scenario["existing_core_load"] = float(sum(core_used_ratios) / max(len(gpus), 1))
+    scenario["existing_load_enabled"] = True
+
+    return scenario
+
+
+def build_conflict_scenario(
+    scenario_id: str,
+    target_load: float,
+    args,
+) -> Dict:
+    """
+    Build one Job containing memory-heavy, core-heavy, and balanced Pods.
+
+    This makes intra-GPU balance learnable: a useful policy should pair
+    complementary Pod shapes instead of filling GPUs with one skewed shape.
+    """
+    num_gpus = random.randint(args.min_gpus, args.max_gpus)
+    memory_total = float(random.choice(args.gpu_memory_choices))
+    core_total = float(args.gpu_core_total)
+
+    gpus = []
+    for i in range(num_gpus):
+        gpus.append(
+            {
+                "gpu_id": i,
+                "memory_total": memory_total,
+                "memory_free": memory_total,
+                "core_total": core_total,
+                "core_free": core_total,
+                "pod_count": 0,
+                "util": 0.0,
+            }
+        )
+
+    def make_pod(kind: str, idx: int) -> Dict:
+        if kind == "memory_heavy":
+            memory_ratio = random.uniform(0.34, 0.58)
+            core_ratio = random.uniform(0.10, 0.34)
+        elif kind == "core_heavy":
+            memory_ratio = random.uniform(0.08, 0.28)
+            core_ratio = random.uniform(0.52, 0.86)
+        else:
+            memory_ratio = random.uniform(0.18, 0.42)
+            core_ratio = random.uniform(0.22, 0.55)
+
+        vgpu_number = random.choices(
+            [1, 2],
+            weights=[0.88, 0.12],
+            k=1,
+        )[0]
+        vgpu_number = min(vgpu_number, num_gpus)
+
+        return {
+            "task_id": f"{scenario_id}-pod-{idx}",
+            "vgpu_number": int(vgpu_number),
+            "memory_demand": round(memory_total * memory_ratio, 4),
+            "core_demand": round(core_total * core_ratio, 4),
+            "profile": kind,
+        }
+
+    pods = [
+        make_pod("memory_heavy", 0),
+        make_pod("core_heavy", 1),
+        make_pod("balanced", 2),
+    ]
+
+    lower = target_load * 0.85 if target_load <= 1.0 else target_load * 0.90
+    upper = target_load * 1.15 if target_load <= 1.0 else target_load * 1.20
+
+    for _ in range(120):
+        scenario = {
+            "scenario_id": scenario_id,
+            "target_load": float(target_load),
+            "gpus": gpus,
+            "pods": pods,
+        }
+        actual_load, _, _ = compute_scenario_load(scenario)
+
+        if lower <= actual_load <= upper:
+            break
+
+        if actual_load < lower and len(pods) < args.max_pods:
+            kind = random.choices(
+                ["memory_heavy", "core_heavy", "balanced"],
+                weights=[0.38, 0.38, 0.24],
+                k=1,
+            )[0]
+            pods.append(make_pod(kind, len(pods)))
+            continue
+
+        if actual_load > upper and len(pods) > max(args.min_pods, 3):
+            removable = list(range(3, len(pods)))
+            if removable:
+                pods.pop(random.choice(removable))
+                continue
+
+        break
+
+    random.shuffle(pods)
+
+    scenario = {
+        "scenario_id": scenario_id,
+        "target_load": float(target_load),
+        "gpus": gpus,
+        "pods": pods,
+        "workload_type": "mixed_conflict",
+    }
+    actual_load, memory_load, core_load = compute_scenario_load(scenario)
+    scenario.update(
+        {
+            "actual_load": actual_load,
+            "memory_load": memory_load,
+            "core_load": core_load,
+            "num_gpus": len(gpus),
+            "num_pods": len(pods),
+        }
+    )
+
+    return scenario
 
 
 def build_hard_cases(args, split: str) -> List[Dict]:
@@ -204,26 +394,70 @@ def generate_split(
     args,
 ) -> List[Dict]:
     rows = []
+    rejected_by_load = 0
+    conflict_ratio = (
+        args.train_conflict_ratio
+        if split == "train"
+        else args.eval_conflict_ratio
+    )
 
     for load in loads:
         for i in range(num_per_load):
             scenario_id = f"{split}-load-{load:.1f}-scenario-{i}"
+            force_conflict = random.random() < conflict_ratio
 
-            scenario = generate_scenario(
-                target_load=load,
-                min_gpus=args.min_gpus,
-                max_gpus=args.max_gpus,
-                min_pods=args.min_pods,
-                max_pods=args.max_pods,
-                gpu_memory_choices=args.gpu_memory_choices,
-                gpu_core_total=args.gpu_core_total,
-                scenario_id=scenario_id,
-                heterogeneous_gpus=False,
-            )
+            scenario = None
+
+            for attempt in range(args.max_generate_attempts):
+                candidate_id = scenario_id
+
+                if attempt > 0:
+                    candidate_id = f"{scenario_id}-retry-{attempt}"
+
+                if force_conflict:
+                    candidate = build_conflict_scenario(
+                        scenario_id=candidate_id,
+                        target_load=load,
+                        args=args,
+                    )
+                else:
+                    candidate = generate_scenario(
+                        target_load=load,
+                        min_gpus=args.min_gpus,
+                        max_gpus=args.max_gpus,
+                        min_pods=args.min_pods,
+                        max_pods=args.max_pods,
+                        gpu_memory_choices=args.gpu_memory_choices,
+                        gpu_core_total=args.gpu_core_total,
+                        scenario_id=candidate_id,
+                        heterogeneous_gpus=False,
+                    )
+
+                candidate = apply_existing_load(candidate, args)
+
+                if not args.strict_actual_load:
+                    scenario = candidate
+                    break
+
+                actual_load = float(candidate.get("actual_load", 0.0))
+
+                if abs(actual_load - load) <= args.actual_load_tolerance:
+                    scenario = candidate
+                    break
+
+                rejected_by_load += 1
+
+            if scenario is None:
+                raise RuntimeError(
+                    f"failed to generate {scenario_id} with actual_load within "
+                    f"{args.actual_load_tolerance} of target {load}; "
+                    f"increase --max-generate-attempts or relax "
+                    f"--actual-load-tolerance"
+                )
 
             rows.append(scenario)
 
-    if not args.disable_hard_cases:
+    if not args.disable_hard_cases and split in args.hard_case_splits:
         hard_cases = build_hard_cases(args, split=split)
 
         if split == "train":
@@ -233,6 +467,9 @@ def generate_split(
 
         for _ in range(repeat):
             rows.extend(copy.deepcopy(hard_cases))
+
+    if rejected_by_load:
+        print(f"{split}: rejected scenarios outside load tolerance: {rejected_by_load}")
 
     return rows
 
@@ -255,10 +492,18 @@ def parse_args():
         type=str,
         default="0.6,0.8,1.0,1.2,1.5",
     )
+    parser.add_argument(
+        "--train-loads",
+        type=str,
+        default=None,
+        help="Optional training-only load list. Use repeated low/mid loads to oversample them.",
+    )
 
     parser.add_argument("--train-per-load", type=int, default=800)
     parser.add_argument("--val-per-load", type=int, default=120)
     parser.add_argument("--test-per-load", type=int, default=120)
+    parser.add_argument("--train-conflict-ratio", type=float, default=0.0)
+    parser.add_argument("--eval-conflict-ratio", type=float, default=0.0)
 
     parser.add_argument("--min-gpus", type=int, default=4)
     parser.add_argument("--max-gpus", type=int, default=8)
@@ -275,9 +520,40 @@ def parse_args():
 
     parser.add_argument("--gpu-core-total", type=float, default=100.0)
 
+    parser.add_argument("--enable-existing-load", action="store_true")
+    parser.add_argument("--existing-load-min", type=float, default=0.05)
+    parser.add_argument("--existing-load-max", type=float, default=0.45)
+    parser.add_argument("--existing-pod-count-min", type=int, default=0)
+    parser.add_argument("--existing-pod-count-max", type=int, default=6)
+    parser.add_argument("--existing-balanced-ratio", type=float, default=0.35)
+    parser.add_argument("--existing-memory-heavy-ratio", type=float, default=0.25)
+    parser.add_argument("--existing-core-heavy-ratio", type=float, default=0.25)
+    parser.add_argument("--existing-light-ratio", type=float, default=0.15)
+
     parser.add_argument("--disable-hard-cases", action="store_true")
     parser.add_argument("--train-hard-repeat", type=int, default=30)
     parser.add_argument("--eval-hard-repeat", type=int, default=1)
+    parser.add_argument(
+        "--hard-case-splits",
+        type=str,
+        nargs="+",
+        default=["train"],
+        choices=["train", "val", "test"],
+        help="Splits that receive fixed hard cases. Default keeps test clean.",
+    )
+    parser.add_argument(
+        "--strict-actual-load",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Retry random scenarios until actual_load is close to target_load.",
+    )
+    parser.add_argument(
+        "--actual-load-tolerance",
+        type=float,
+        default=0.12,
+        help="Maximum absolute difference between actual_load and target_load.",
+    )
+    parser.add_argument("--max-generate-attempts", type=int, default=500)
 
     # 真实测试对应的 hard case，单位保持和 simulator 一致即可。
     # 这里用 MB，是为了和真实 YAML 的 vgpu-memory=8192 对齐。
@@ -296,10 +572,12 @@ def main():
     ensure_dir(args.output_dir)
 
     loads = parse_loads(args.loads)
+    train_loads = parse_loads(args.train_loads) if args.train_loads else loads
 
     print("========== Generate Homogeneous Scenarios ==========")
     print(f"output_dir         : {args.output_dir}")
     print(f"loads              : {loads}")
+    print(f"train_loads        : {train_loads}")
     print(f"train_per_load     : {args.train_per_load}")
     print(f"val_per_load       : {args.val_per_load}")
     print(f"test_per_load      : {args.test_per_load}")
@@ -312,7 +590,7 @@ def main():
     train_rows = generate_split(
         split="train",
         num_per_load=args.train_per_load,
-        loads=loads,
+        loads=train_loads,
         args=args,
     )
 

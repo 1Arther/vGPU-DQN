@@ -1,6 +1,0 @@
-scenario_id,dqn,random,volcano-vgpu-binpack,volcano-vgpu-spread
-test-hard-4gpu-12pod-small,0.0,0.0,0.0,0.0
-test-hard-4gpu-4pod-1vgpu,0.0,0.0,0.0,0.0
-test-hard-4gpu-4pod-2vgpu,0.0,0.0,0.0,0.0
-test-hard-4gpu-8pod-1vgpu,0.0,0.0,0.0,0.0
-test-hard-8gpu-16pod-1vgpu,0.0,0.0,0.0,0.0

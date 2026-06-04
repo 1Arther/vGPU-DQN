@@ -197,6 +197,30 @@ def build_hard_cases(args) -> List[Dict]:
     return cases
 
 
+def has_fixed_hard_cases(scenarios: List[Dict]) -> bool:
+    return any("-hard-" in str(s.get("scenario_id", "")) for s in scenarios)
+
+
+def compute_checkpoint_score(eval_result: Dict, args) -> float:
+    all_objective = float(eval_result["avg_objective"])
+    conflict_objective = float(
+        eval_result.get("conflict_avg_objective", all_objective)
+    )
+    lowmid_objective = float(
+        eval_result.get("lowmid_avg_objective", all_objective)
+    )
+    conflict_intra = float(
+        eval_result.get("conflict_avg_intra_gpu_balance_score", eval_result["avg_intra_gpu_balance_score"])
+    )
+
+    return float(
+        all_objective
+        + args.checkpoint_conflict_objective_weight * conflict_objective
+        + args.checkpoint_lowmid_objective_weight * lowmid_objective
+        - args.checkpoint_conflict_intra_weight * conflict_intra
+    )
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Train mixed-load DQN model with job-batch hard cases"
@@ -225,6 +249,7 @@ def parse_args():
     parser.add_argument("--episodes", type=int, default=8000)
 
     parser.add_argument("--hidden-dim", type=int, default=256)
+    parser.add_argument("--disable-job-features", action="store_true")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--gamma", type=float, default=0.9)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -237,7 +262,22 @@ def parse_args():
 
     parser.add_argument("--success-weight", type=float, default=2.0)
     parser.add_argument("--balance-weight", type=float, default=1.0)
+    parser.add_argument("--inter-balance-weight", type=float, default=1.0)
+    parser.add_argument("--intra-balance-weight", type=float, default=1.0)
+    parser.add_argument("--delta-balance-weight", type=float, default=1.0)
+    parser.add_argument("--delta-inter-balance-weight", type=float, default=None)
+    parser.add_argument("--delta-intra-balance-weight", type=float, default=None)
     parser.add_argument("--failure-weight", type=float, default=2.0)
+    parser.add_argument("--action-rerank-topk", type=int, default=0)
+    parser.add_argument("--action-rerank-q-weight", type=float, default=1.0)
+    parser.add_argument("--action-rerank-balance-weight", type=float, default=1.0)
+    parser.add_argument("--action-rerank-inter-weight", type=float, default=0.0)
+    parser.add_argument("--action-rerank-intra-weight", type=float, default=0.0)
+    parser.add_argument("--train-action-rerank", action="store_true")
+    parser.add_argument("--checkpoint-conflict-objective-weight", type=float, default=0.3)
+    parser.add_argument("--checkpoint-lowmid-objective-weight", type=float, default=0.2)
+    parser.add_argument("--checkpoint-conflict-intra-weight", type=float, default=0.2)
+    parser.add_argument("--checkpoint-lowmid-load-threshold", type=float, default=1.0)
 
     parser.add_argument("--target-update-interval", type=int, default=20)
     parser.add_argument("--eval-interval", type=int, default=100)
@@ -249,6 +289,16 @@ def parse_args():
 
     parser.add_argument("--disable-hard-cases", action="store_true")
     parser.add_argument("--hard-case-repeat", type=int, default=80)
+    parser.add_argument(
+        "--force-add-hard-cases",
+        action="store_true",
+        help="Append built-in hard cases even when the input dataset already contains them.",
+    )
+    parser.add_argument(
+        "--add-hard-cases-to-val",
+        action="store_true",
+        help="Also append built-in hard cases to validation. Default keeps validation clean.",
+    )
 
     parser.add_argument("--hard-memory-total", type=float, default=49152.0)
     parser.add_argument("--hard-memory-demand", type=float, default=8192.0)
@@ -285,10 +335,21 @@ def main():
     if not args.disable_hard_cases:
         hard_cases = build_hard_cases(args)
 
-        for _ in range(args.hard_case_repeat):
-            train_scenarios.extend(copy.deepcopy(hard_cases))
+        train_has_hard = has_fixed_hard_cases(train_scenarios)
+        val_has_hard = has_fixed_hard_cases(val_scenarios)
 
-        val_scenarios.extend(copy.deepcopy(hard_cases))
+        if args.force_add_hard_cases or not train_has_hard:
+            for _ in range(args.hard_case_repeat):
+                train_scenarios.extend(copy.deepcopy(hard_cases))
+        else:
+            print("train hard cases already present; skip extra append")
+
+        if args.add_hard_cases_to_val and (args.force_add_hard_cases or not val_has_hard):
+            val_scenarios.extend(copy.deepcopy(hard_cases))
+        elif not args.add_hard_cases_to_val:
+            print("validation hard case append disabled")
+        else:
+            print("val hard cases already present; skip extra append")
 
         print(f"hard cases added      : {len(hard_cases)}")
         print(f"hard case repeat      : {args.hard_case_repeat}")
@@ -303,6 +364,7 @@ def main():
 
     log_rows = []
     best_eval_objective = -1e18
+    best_checkpoint_score = -1e18
     no_improve_count = 0
 
     order = list(range(len(train_scenarios)))
@@ -339,6 +401,10 @@ def main():
         eval_failure = ""
         eval_vgpu_success = ""
         eval_vgpu_failure = ""
+        eval_checkpoint_score = ""
+        eval_conflict_objective = ""
+        eval_conflict_intra = ""
+        eval_lowmid_objective = ""
 
         if episode % args.eval_interval == 0:
             eval_result = evaluate_dqn_on_scenarios(
@@ -353,9 +419,14 @@ def main():
             eval_failure = eval_result["avg_failure_rate"]
             eval_vgpu_success = eval_result["avg_vgpu_success_rate"]
             eval_vgpu_failure = eval_result["avg_vgpu_failure_rate"]
+            eval_checkpoint_score = compute_checkpoint_score(eval_result, args)
+            eval_conflict_objective = eval_result.get("conflict_avg_objective", "")
+            eval_conflict_intra = eval_result.get("conflict_avg_intra_gpu_balance_score", "")
+            eval_lowmid_objective = eval_result.get("lowmid_avg_objective", "")
 
-            if eval_objective > best_eval_objective:
+            if eval_checkpoint_score > best_checkpoint_score:
                 best_eval_objective = eval_objective
+                best_checkpoint_score = eval_checkpoint_score
                 no_improve_count = 0
                 agent.save(best_model_path, args=args)
                 improved = "*"
@@ -376,7 +447,10 @@ def main():
                 f"loss={loss:.6f} "
                 f"epsilon={agent.epsilon:.4f} "
                 f"eval_objective={eval_objective:.4f} "
+                f"eval_score={eval_checkpoint_score:.4f} "
                 f"eval_success={eval_success:.4f} "
+                f"eval_conflict_objective={eval_conflict_objective:.4f} "
+                f"eval_conflict_intra={eval_conflict_intra:.4f} "
                 f"{improved}"
             )
 
@@ -387,7 +461,8 @@ def main():
             ):
                 print(
                     f"early stopped at episode={episode}, "
-                    f"best_eval_objective={best_eval_objective:.6f}"
+                    f"best_eval_objective={best_eval_objective:.6f}, "
+                    f"best_checkpoint_score={best_checkpoint_score:.6f}"
                 )
                 break
 
@@ -437,7 +512,12 @@ def main():
                 "eval_failure_rate": eval_failure,
                 "eval_vgpu_success_rate": eval_vgpu_success,
                 "eval_vgpu_failure_rate": eval_vgpu_failure,
+                "eval_checkpoint_score": eval_checkpoint_score,
+                "eval_conflict_objective": eval_conflict_objective,
+                "eval_conflict_intra_gpu_balance_score": eval_conflict_intra,
+                "eval_lowmid_objective": eval_lowmid_objective,
                 "best_eval_objective": best_eval_objective,
+                "best_checkpoint_score": best_checkpoint_score,
             }
         )
 

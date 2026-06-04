@@ -722,10 +722,12 @@ def reset_gpus(gpu_templates: List[Dict]) -> List[Dict]:
     gpus = copy.deepcopy(gpu_templates)
 
     for gpu in gpus:
-        gpu["memory_free"] = gpu["memory_total"]
-        gpu["core_free"] = gpu["core_total"]
-        gpu["pod_count"] = 0
-        gpu["util"] = 0.0
+        gpu.setdefault("memory_free", gpu["memory_total"])
+        gpu.setdefault("core_free", gpu["core_total"])
+        gpu.setdefault("pod_count", 0)
+
+        core_used_ratio = 1.0 - gpu["core_free"] / max(gpu["core_total"], 1e-8)
+        gpu["util"] = gpu.get("util", max(0.0, min(100.0, core_used_ratio * 100.0)))
 
     return gpus
 
@@ -967,6 +969,23 @@ class GNNBasedDQNAgent:
 
         return int(gpu_idx.item()), int(pod_idx.item())
 
+    def q_matrix(self, graph_data, valid_mask: Optional[torch.Tensor] = None) -> np.ndarray:
+        gpu_feats, pod_feats, adj = graph_data
+
+        gpu_feats_t = torch.tensor(gpu_feats, dtype=torch.float32, device=device)
+        pod_feats_t = torch.tensor(pod_feats, dtype=torch.float32, device=device)
+        adj_t = torch.tensor(adj, dtype=torch.float32, device=device)
+
+        with torch.no_grad():
+            gpu_emb, pod_emb = self.gnn_encoder(gpu_feats_t, pod_feats_t, adj_t)
+            q_mat = self.q_net(gpu_emb, pod_emb)
+
+            if valid_mask is not None:
+                q_mat = q_mat.clone()
+                q_mat[~valid_mask] = -1e9
+
+        return q_mat.detach().cpu().numpy()
+
     def remember(self, graph_data, action, reward: float, next_graph_data, done: bool):
         gpu_feats, pod_feats, adj = graph_data
 
@@ -1143,9 +1162,11 @@ class GNNBasedDQNAgent:
 
 
 def create_agent(args) -> GNNBasedDQNAgent:
+    use_job_features = not bool(getattr(args, "disable_job_features", False))
+
     return GNNBasedDQNAgent(
-        gpu_feat_dim=6,
-        pod_feat_dim=4,
+        gpu_feat_dim=17 if use_job_features else 8,
+        pod_feat_dim=15 if use_job_features else 6,
         hidden_dim=args.hidden_dim,
         lr=args.lr,
         gamma=args.gamma,
@@ -1247,7 +1268,7 @@ def allocate_pod_to_gpus(
         update_gpu_resources(gpus[idx], pod)
 
 
-def balance_score(gpus: List[Dict]) -> float:
+def _gpu_usage_ratios(gpus: List[Dict]) -> Tuple[List[float], List[float]]:
     memory_usages = [
         1.0 - g["memory_free"] / max(g["memory_total"], 1e-8)
         for g in gpus
@@ -1258,13 +1279,58 @@ def balance_score(gpus: List[Dict]) -> float:
         for g in gpus
     ]
 
+    return memory_usages, core_usages
+
+
+def inter_gpu_balance_score(gpus: List[Dict]) -> float:
+    """
+    Balance between GPUs.
+
+    Lower is better: all GPUs have similar memory/core usage ratios.
+    """
+    memory_usages, core_usages = _gpu_usage_ratios(gpus)
     return float(np.std(memory_usages) + np.std(core_usages))
+
+
+def intra_gpu_balance_score(gpus: List[Dict]) -> float:
+    """
+    Balance inside each GPU between memory and core pressure.
+
+    Lower is better: a GPU using 80% memory and 80% core is more balanced than
+    a GPU using 80% memory and 10% core.
+    """
+    memory_usages, core_usages = _gpu_usage_ratios(gpus)
+
+    if not memory_usages:
+        return 0.0
+
+    diffs = [
+        abs(memory_usage - core_usage)
+        for memory_usage, core_usage in zip(memory_usages, core_usages)
+    ]
+
+    return float(mean(diffs))
+
+
+def balance_score(gpus: List[Dict], args=None) -> float:
+    inter_weight = 1.0
+    intra_weight = 1.0
+
+    if args is not None:
+        inter_weight = float(getattr(args, "inter_balance_weight", inter_weight))
+        intra_weight = float(getattr(args, "intra_balance_weight", intra_weight))
+
+    return float(
+        inter_weight * inter_gpu_balance_score(gpus)
+        + intra_weight * intra_gpu_balance_score(gpus)
+    )
 
 
 def select_gpus_for_pod_by_anchor(
     gpus: List[Dict],
     pod: Dict,
     anchor_gpu_idx: int,
+    args=None,
 ) -> Optional[List[int]]:
     """
     DQN multi-vGPU allocation helper.
@@ -1306,7 +1372,7 @@ def select_gpus_for_pod_by_anchor(
         except ValueError:
             continue
 
-        score = balance_score(trial_gpus)
+        score = balance_score(trial_gpus, args=args)
         tie_key = tuple(sorted(selected))
 
         if best_selected is None:
@@ -1325,14 +1391,154 @@ def select_gpus_for_pod_by_anchor(
     return best_selected
 
 
+def select_dqn_action(
+    agent: GNNBasedDQNAgent,
+    graph_data,
+    valid_mask: torch.Tensor,
+    gpus: List[Dict],
+    pods: List[Dict],
+    args,
+    train: bool,
+) -> Tuple[int, int]:
+    topk = int(getattr(args, "action_rerank_topk", 0))
+    use_train_rerank = bool(getattr(args, "train_action_rerank", False))
+
+    if topk <= 0 or (train and not use_train_rerank):
+        return agent.act(graph_data, valid_mask)
+
+    if train and random.random() < agent.epsilon:
+        valid_indices = torch.nonzero(valid_mask, as_tuple=False)
+
+        if valid_indices.size(0) == 0:
+            return 0, 0
+
+        rand_idx = random.randint(0, valid_indices.size(0) - 1)
+        gpu_idx, pod_idx = valid_indices[rand_idx].tolist()
+        return int(gpu_idx), int(pod_idx)
+
+    q_mat = agent.q_matrix(graph_data, valid_mask=valid_mask)
+    valid_np = valid_mask.detach().cpu().numpy().astype(bool)
+
+    valid_flat = np.flatnonzero(valid_np.reshape(-1))
+    if len(valid_flat) == 0:
+        return 0, 0
+
+    flat_q = q_mat.reshape(-1)
+    candidate_count = min(topk, len(valid_flat))
+    candidate_flat = valid_flat[
+        np.argpartition(-flat_q[valid_flat], candidate_count - 1)[:candidate_count]
+    ]
+
+    q_values = flat_q[candidate_flat]
+    q_min = float(np.min(q_values))
+    q_max = float(np.max(q_values))
+    q_den = max(q_max - q_min, 1e-8)
+
+    q_weight = float(getattr(args, "action_rerank_q_weight", 1.0))
+    balance_weight = float(getattr(args, "action_rerank_balance_weight", 1.0))
+    intra_weight = float(getattr(args, "action_rerank_intra_weight", 0.0))
+    inter_weight = float(getattr(args, "action_rerank_inter_weight", 0.0))
+
+    best_action = None
+    best_score = -float("inf")
+    best_tie_key = None
+    num_pods = q_mat.shape[1]
+
+    for flat_idx in candidate_flat:
+        gpu_idx = int(flat_idx // num_pods)
+        pod_idx = int(flat_idx % num_pods)
+        pod = pods[pod_idx]
+
+        selected_gpu_indices = select_gpus_for_pod_by_anchor(
+            gpus=gpus,
+            pod=pod,
+            anchor_gpu_idx=gpu_idx,
+            args=args,
+        )
+
+        if selected_gpu_indices is None:
+            continue
+
+        trial_gpus = copy.deepcopy(gpus)
+
+        try:
+            allocate_pod_to_gpus(trial_gpus, pod, selected_gpu_indices)
+        except ValueError:
+            continue
+
+        q_norm = (float(flat_q[flat_idx]) - q_min) / q_den
+        post_balance = balance_score(trial_gpus, args=args)
+        post_inter = inter_gpu_balance_score(trial_gpus)
+        post_intra = intra_gpu_balance_score(trial_gpus)
+
+        score = (
+            q_weight * q_norm
+            - balance_weight * post_balance
+            - inter_weight * post_inter
+            - intra_weight * post_intra
+        )
+        tie_key = (post_balance, post_intra, post_inter, gpu_idx, pod_idx)
+
+        if best_action is None:
+            best_action = (gpu_idx, pod_idx)
+            best_score = score
+            best_tie_key = tie_key
+        elif score > best_score + 1e-12:
+            best_action = (gpu_idx, pod_idx)
+            best_score = score
+            best_tie_key = tie_key
+        elif abs(score - best_score) <= 1e-12 and tie_key < best_tie_key:
+            best_action = (gpu_idx, pod_idx)
+            best_score = score
+            best_tie_key = tie_key
+
+    if best_action is None:
+        return agent.act(graph_data, valid_mask)
+
+    return best_action
+
+
 def build_vgpu_graph(
     gpus: List[Dict],
     pods: List[Dict],
     allocations: Dict[str, List[int]],
+    args=None,
 ):
     max_memory = max(g["memory_total"] for g in gpus)
     max_core = max(g["core_total"] for g in gpus)
     max_pods = max(1, len(pods))
+    unallocated_pods = [
+        pod for pod in pods
+        if pod["task_id"] not in allocations
+    ]
+
+    use_job_features = not bool(getattr(args, "disable_job_features", False))
+
+    if use_job_features and unallocated_pods:
+        pod_memory_ratios = np.array(
+            [p["memory_demand"] / max_memory for p in unallocated_pods],
+            dtype=np.float32,
+        )
+        pod_core_ratios = np.array(
+            [p["core_demand"] / max_core for p in unallocated_pods],
+            dtype=np.float32,
+        )
+        pod_gaps = np.abs(pod_memory_ratios - pod_core_ratios)
+        pod_signed_gaps = pod_memory_ratios - pod_core_ratios
+
+        job_feats = [
+            float(np.mean(pod_memory_ratios)),
+            float(np.mean(pod_core_ratios)),
+            float(np.std(pod_memory_ratios)),
+            float(np.std(pod_core_ratios)),
+            float(np.mean(pod_gaps)),
+            float(np.max(pod_gaps)),
+            float(np.mean(pod_signed_gaps > 0.15)),
+            float(np.mean(pod_signed_gaps < -0.15)),
+            float(len(unallocated_pods) / max_pods),
+        ]
+    else:
+        job_feats = [0.0] * 9
 
     gpu_feats = []
 
@@ -1343,31 +1549,47 @@ def build_vgpu_graph(
         util_ratio = gpu["util"] / 100.0
         memory_free_ratio = gpu["memory_free"] / max_memory
         core_free_ratio = gpu["core_free"] / max_core
+        memory_core_gap = abs(memory_used_ratio - core_used_ratio)
+        memory_minus_core = memory_used_ratio - core_used_ratio
 
-        gpu_feats.append(
-            [
+        feat = [
                 memory_used_ratio,
                 core_used_ratio,
                 pod_count_ratio,
                 util_ratio,
                 memory_free_ratio,
                 core_free_ratio,
-            ]
-        )
+                memory_core_gap,
+                memory_minus_core,
+        ]
+
+        if use_job_features:
+            feat.extend(job_feats)
+
+        gpu_feats.append(feat)
 
     pod_feats = []
 
     for pod in pods:
         allocated_flag = 1.0 if pod["task_id"] in allocations else 0.0
+        pod_memory_ratio = pod["memory_demand"] / max_memory
+        pod_core_ratio = pod["core_demand"] / max_core
+        pod_memory_core_gap = abs(pod_memory_ratio - pod_core_ratio)
+        pod_memory_minus_core = pod_memory_ratio - pod_core_ratio
 
-        pod_feats.append(
-            [
-                pod["memory_demand"] / max_memory,
-                pod["core_demand"] / max_core,
+        feat = [
+                pod_memory_ratio,
+                pod_core_ratio,
                 get_required_vgpu_number(pod) / max(1.0, len(gpus)),
                 allocated_flag,
-            ]
-        )
+                pod_memory_core_gap,
+                pod_memory_minus_core,
+        ]
+
+        if use_job_features:
+            feat.extend(job_feats)
+
+        pod_feats.append(feat)
 
     adj = np.zeros((len(gpus), len(pods)), dtype=np.float32)
 
@@ -1408,14 +1630,47 @@ def calculate_step_reward(
     allocated_count: int,
     total_pods: int,
     args,
+    previous_balance: Optional[float] = None,
+    previous_inter_balance: Optional[float] = None,
+    previous_intra_balance: Optional[float] = None,
 ) -> float:
     current_success = allocated_count / max(total_pods, 1)
     current_failure = 1.0 - current_success
-    current_balance = balance_score(gpus)
+    current_balance = balance_score(gpus, args=args)
+    current_inter_balance = inter_gpu_balance_score(gpus)
+    current_intra_balance = intra_gpu_balance_score(gpus)
+    balance_delta = 0.0
+    inter_balance_delta = 0.0
+    intra_balance_delta = 0.0
+
+    if previous_balance is not None:
+        balance_delta = previous_balance - current_balance
+
+    if previous_inter_balance is not None:
+        inter_balance_delta = previous_inter_balance - current_inter_balance
+
+    if previous_intra_balance is not None:
+        intra_balance_delta = previous_intra_balance - current_intra_balance
+
+    delta_inter_weight = getattr(args, "delta_inter_balance_weight", None)
+    delta_intra_weight = getattr(args, "delta_intra_balance_weight", None)
+
+    if delta_inter_weight is None and delta_intra_weight is None:
+        delta_reward = getattr(args, "delta_balance_weight", 1.0) * balance_delta
+    else:
+        if delta_inter_weight is None:
+            delta_inter_weight = getattr(args, "delta_balance_weight", 1.0)
+        if delta_intra_weight is None:
+            delta_intra_weight = getattr(args, "delta_balance_weight", 1.0)
+        delta_reward = (
+            float(delta_inter_weight) * inter_balance_delta
+            + float(delta_intra_weight) * intra_balance_delta
+        )
 
     return float(
         1.0
         + 0.5 * args.success_weight * current_success
+        + delta_reward
         - 0.2 * args.balance_weight * current_balance
         - 0.1 * args.failure_weight * current_failure
     )
@@ -1429,7 +1684,7 @@ def calculate_terminal_reward(
 ) -> float:
     success = allocated_count / max(total_pods, 1)
     failure = 1.0 - success
-    bal = balance_score(gpus)
+    bal = balance_score(gpus, args=args)
 
     return float(
         3.0 * calculate_objective(success, bal, failure, args)
@@ -1460,7 +1715,9 @@ def finalize_metrics(
     vgpu_success_rate = allocated_vgpu_count / max(total_vgpu_count, 1)
     vgpu_failure_rate = failure_vgpu_count / max(total_vgpu_count, 1)
 
-    bal = balance_score(gpus)
+    inter_bal = inter_gpu_balance_score(gpus)
+    intra_bal = intra_gpu_balance_score(gpus)
+    bal = balance_score(gpus, args=args)
     objective = calculate_objective(success_rate, bal, failure_rate, args)
 
     actual_load, memory_load, core_load = compute_scenario_load(scenario)
@@ -1468,11 +1725,14 @@ def finalize_metrics(
     return {
         "method": method,
         "scenario_id": scenario["scenario_id"],
+        "workload_type": scenario.get("workload_type", "random"),
         "target_load": scenario["target_load"],
         "actual_load": actual_load,
         "memory_load": memory_load,
         "core_load": core_load,
         "balance_score": bal,
+        "inter_gpu_balance_score": inter_bal,
+        "intra_gpu_balance_score": intra_bal,
         "success_rate": success_rate,
         "failure_rate": failure_rate,
         "vgpu_success_rate": vgpu_success_rate,
@@ -1503,7 +1763,7 @@ def run_one_episode(
     total_reward = 0.0
     steps = 0
 
-    graph_data = build_vgpu_graph(gpus, pods, allocations)
+    graph_data = build_vgpu_graph(gpus, pods, allocations, args=args)
 
     while len(allocations) < len(pods):
         _, _, adj = graph_data
@@ -1524,7 +1784,15 @@ def run_one_episode(
             total_reward += terminal_reward
             break
 
-        action = agent.act(graph_data, valid_mask)
+        action = select_dqn_action(
+            agent=agent,
+            graph_data=graph_data,
+            valid_mask=valid_mask,
+            gpus=gpus,
+            pods=pods,
+            args=args,
+            train=train,
+        )
         gpu_idx, pod_idx = action
         pod = pods[pod_idx]
 
@@ -1532,6 +1800,7 @@ def run_one_episode(
             gpus=gpus,
             pod=pod,
             anchor_gpu_idx=gpu_idx,
+            args=args,
         )
 
         if selected_gpu_indices is None:
@@ -1539,6 +1808,10 @@ def run_one_episode(
             next_graph_data = graph_data
             done = True
         else:
+            previous_balance = balance_score(gpus, args=args)
+            previous_inter_balance = inter_gpu_balance_score(gpus)
+            previous_intra_balance = intra_gpu_balance_score(gpus)
+
             allocate_pod_to_gpus(gpus, pod, selected_gpu_indices)
             allocations[pod["task_id"]] = selected_gpu_indices
 
@@ -1547,9 +1820,12 @@ def run_one_episode(
                 allocated_count=len(allocations),
                 total_pods=len(pods),
                 args=args,
+                previous_balance=previous_balance,
+                previous_inter_balance=previous_inter_balance,
+                previous_intra_balance=previous_intra_balance,
             )
 
-            next_graph_data = build_vgpu_graph(gpus, pods, allocations)
+            next_graph_data = build_vgpu_graph(gpus, pods, allocations, args=args)
 
             done = (
                 len(allocations) == len(pods)
@@ -1601,6 +1877,8 @@ BASELINE_METHODS = [
     "used-mem-asc",
     "index-desc",
     "random",
+    "greedy-balance",
+    "greedy-objective",
 ]
 
 
@@ -1712,6 +1990,16 @@ def run_baseline(
 
     allocations: Dict[str, List[int]] = {}
 
+    if method in {"greedy-balance", "greedy-objective"}:
+        return run_greedy_baseline(
+            method=method,
+            scenario=scenario,
+            gpus=gpus,
+            pods=pods,
+            allocations=allocations,
+            args=args,
+        )
+
     for pod in pods:
         selected_gpu_indices = select_gpus_for_pod_by_policy(
             method=method,
@@ -1733,6 +2021,122 @@ def run_baseline(
         args=args,
         total_reward=0.0,
         steps=len(allocations),
+    )
+
+
+def run_greedy_baseline(
+    method: str,
+    scenario: Dict,
+    gpus: List[Dict],
+    pods: List[Dict],
+    allocations: Dict[str, List[int]],
+    args,
+) -> Dict:
+    total_pods = len(pods)
+    steps = 0
+
+    while len(allocations) < total_pods:
+        best_candidate = None
+        best_score = -float("inf")
+        best_tie_key = None
+
+        for pod_idx, pod in enumerate(pods):
+            if pod["task_id"] in allocations:
+                continue
+
+            feasible = get_feasible_gpus_for_pod(gpus, pod)
+
+            for anchor_gpu_idx in feasible:
+                selected_gpu_indices = select_gpus_for_pod_by_anchor(
+                    gpus=gpus,
+                    pod=pod,
+                    anchor_gpu_idx=anchor_gpu_idx,
+                    args=args,
+                )
+
+                if selected_gpu_indices is None:
+                    continue
+
+                trial_gpus = copy.deepcopy(gpus)
+
+                try:
+                    allocate_pod_to_gpus(trial_gpus, pod, selected_gpu_indices)
+                except ValueError:
+                    continue
+
+                post_balance = balance_score(trial_gpus, args=args)
+                post_inter = inter_gpu_balance_score(trial_gpus)
+                post_intra = intra_gpu_balance_score(trial_gpus)
+
+                if method == "greedy-balance":
+                    score = -post_balance
+                elif method == "greedy-objective":
+                    success = (len(allocations) + 1) / max(total_pods, 1)
+                    failure = 1.0 - success
+                    remaining_pods = [
+                        p for p in pods
+                        if p["task_id"] not in allocations
+                        and p["task_id"] != pod["task_id"]
+                    ]
+                    future_feasible = 0
+
+                    for remaining_pod in remaining_pods:
+                        if any(
+                            select_gpus_for_pod_by_anchor(
+                                gpus=trial_gpus,
+                                pod=remaining_pod,
+                                anchor_gpu_idx=idx,
+                                args=args,
+                            ) is not None
+                            for idx in get_feasible_gpus_for_pod(trial_gpus, remaining_pod)
+                        ):
+                            future_feasible += 1
+
+                    future_feasible_ratio = future_feasible / max(len(remaining_pods), 1)
+                    score = (
+                        calculate_objective(success, post_balance, failure, args)
+                        + 0.25 * future_feasible_ratio
+                    )
+                else:
+                    raise ValueError(f"unknown greedy baseline method: {method}")
+
+                tie_key = (
+                    post_balance,
+                    post_intra,
+                    post_inter,
+                    pod_idx,
+                    tuple(selected_gpu_indices),
+                )
+
+                if best_candidate is None:
+                    best_candidate = (pod, selected_gpu_indices)
+                    best_score = score
+                    best_tie_key = tie_key
+                elif score > best_score + 1e-12:
+                    best_candidate = (pod, selected_gpu_indices)
+                    best_score = score
+                    best_tie_key = tie_key
+                elif abs(score - best_score) <= 1e-12 and tie_key < best_tie_key:
+                    best_candidate = (pod, selected_gpu_indices)
+                    best_score = score
+                    best_tie_key = tie_key
+
+        if best_candidate is None:
+            break
+
+        pod, selected_gpu_indices = best_candidate
+        allocate_pod_to_gpus(gpus, pod, selected_gpu_indices)
+        allocations[pod["task_id"]] = selected_gpu_indices
+        steps += 1
+
+    return finalize_metrics(
+        method=method,
+        scenario=scenario,
+        gpus=gpus,
+        allocations=allocations,
+        args=args,
+        total_reward=0.0,
+        steps=steps,
     )
 
 
@@ -1761,14 +2165,48 @@ def evaluate_dqn_on_scenarios(
 
     agent.epsilon = old_epsilon
 
-    return {
-        "avg_objective": mean([r["objective"] for r in rows]),
-        "avg_balance_score": mean([r["balance_score"] for r in rows]),
-        "avg_success_rate": mean([r["success_rate"] for r in rows]),
-        "avg_failure_rate": mean([r["failure_rate"] for r in rows]),
-        "avg_vgpu_success_rate": mean([r["vgpu_success_rate"] for r in rows]),
-        "avg_vgpu_failure_rate": mean([r["vgpu_failure_rate"] for r in rows]),
-    }
+    def add_group_metrics(result: Dict, prefix: str, group_rows: List[Dict]):
+        if not group_rows:
+            group_rows = rows
+
+        result[f"{prefix}avg_objective"] = mean([r["objective"] for r in group_rows])
+        result[f"{prefix}avg_balance_score"] = mean([r["balance_score"] for r in group_rows])
+        result[f"{prefix}avg_inter_gpu_balance_score"] = mean(
+            [r["inter_gpu_balance_score"] for r in group_rows]
+        )
+        result[f"{prefix}avg_intra_gpu_balance_score"] = mean(
+            [r["intra_gpu_balance_score"] for r in group_rows]
+        )
+        result[f"{prefix}avg_success_rate"] = mean([r["success_rate"] for r in group_rows])
+        result[f"{prefix}avg_failure_rate"] = mean([r["failure_rate"] for r in group_rows])
+        result[f"{prefix}avg_vgpu_success_rate"] = mean(
+            [r["vgpu_success_rate"] for r in group_rows]
+        )
+        result[f"{prefix}avg_vgpu_failure_rate"] = mean(
+            [r["vgpu_failure_rate"] for r in group_rows]
+        )
+
+    result = {}
+    add_group_metrics(result, "", rows)
+
+    conflict_rows = [
+        r for r in rows
+        if r.get("workload_type") == "mixed_conflict"
+    ]
+    lowmid_threshold = float(getattr(args, "checkpoint_lowmid_load_threshold", 1.0))
+    lowmid_rows = [
+        r for r in rows
+        if float(r.get("actual_load", 0.0)) <= lowmid_threshold
+    ]
+
+    add_group_metrics(result, "conflict_", conflict_rows)
+    add_group_metrics(result, "lowmid_", lowmid_rows)
+
+    result["conflict_count"] = len(conflict_rows)
+    result["lowmid_count"] = len(lowmid_rows)
+    result["eval_count"] = len(rows)
+
+    return result
 
 
 def summarize_detail_rows(rows: List[Dict], target_load: float) -> List[Dict]:
