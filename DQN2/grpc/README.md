@@ -122,3 +122,15 @@ dqn-scheduler-grpc.volcano-system.svc.cluster.local:50051
 ```
 
 If the scheduler runs in the same namespace, `dqn-scheduler-grpc:50051` is also enough.
+
+### HostPath Deployment for the Current 10.33 Cluster
+
+The current 10.33 environment has containerd but no Docker/nerdctl build tool. For immediate cluster testing, use the hostPath manifest. It mounts `/home/zbs/vGPU-DQN` into a PyTorch runtime Pod on `t3dgq` and starts the gRPC server from the checked-out repository:
+
+```bash
+kubectl apply -f DQN2/grpc/k8s/service.yaml
+kubectl apply -f DQN2/grpc/k8s/deployment-hostpath.yaml
+kubectl rollout status deployment/dqn-scheduler-grpc -n volcano-system
+```
+
+This is suitable for development. For repeatable production deployment, build and publish the `DQN2/grpc/Dockerfile` image instead.

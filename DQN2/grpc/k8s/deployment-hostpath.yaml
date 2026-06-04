@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dqn-scheduler-grpc
+  namespace: volcano-system
+  labels:
+    app: dqn-scheduler-grpc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dqn-scheduler-grpc
+  template:
+    metadata:
+      labels:
+        app: dqn-scheduler-grpc
+    spec:
+      nodeName: t3dgq
+      containers:
+        - name: grpc
+          image: pytorch/pytorch:2.2.2-cuda12.1-cudnn8-runtime
+          imagePullPolicy: IfNotPresent
+          workingDir: /app
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              python -m pip install --no-cache-dir grpcio protobuf >/tmp/dqn-grpc-pip.log 2>&1 || cat /tmp/dqn-grpc-pip.log
+              exec python DQN2/grpc/dqn_scheduler_server.py \
+                --model DQN2/outputs_mixed_load_preload_v16_jobfeatures_multiscore_trainrerank/vgpu_dqn_mixed_best.pth \
+                --host 0.0.0.0 \
+                --port 50051 \
+                --hidden-dim 512 \
+                --action-rerank-topk 32 \
+                --action-rerank-balance-weight 1.0 \
+                --action-rerank-q-weight 1.0
+          ports:
+            - name: grpc
+              containerPort: 50051
+          readinessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 6Gi
+          volumeMounts:
+            - name: repo
+              mountPath: /app
+      volumes:
+        - name: repo
+          hostPath:
+            path: /home/zbs/vGPU-DQN
+            type: Directory
