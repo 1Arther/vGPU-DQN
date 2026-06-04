@@ -1,0 +1,6 @@
+.git
+**/__pycache__
+**/*.pyc
+DQN2/outputs_*/*
+!DQN2/outputs_mixed_load_preload_v16_jobfeatures_multiscore_trainrerank/
+!DQN2/outputs_mixed_load_preload_v16_jobfeatures_multiscore_trainrerank/vgpu_dqn_mixed_best.pth

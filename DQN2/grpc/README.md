@@ -98,3 +98,27 @@ job-4pod-2vgpu-3 -> [2, 3]
 ```
 
 Each GPU receives two slices, i.e. 16384 MB and 50 core, which is within the 49152 MB / 100 core capacity.
+
+## Kubernetes Deployment
+
+Build the inference image from the repository root:
+
+```bash
+cd /home/zbs/vGPU-DQN
+IMAGE=vgpu-dqn-grpc:v8 DQN2/grpc/scripts/build_grpc_image.sh
+```
+
+Deploy the gRPC service into the Volcano namespace:
+
+```bash
+kubectl apply -k DQN2/grpc/k8s
+kubectl rollout status deployment/dqn-scheduler-grpc -n volcano-system
+```
+
+In-cluster endpoint for Volcano scheduler:
+
+```text
+dqn-scheduler-grpc.volcano-system.svc.cluster.local:50051
+```
+
+If the scheduler runs in the same namespace, `dqn-scheduler-grpc:50051` is also enough.

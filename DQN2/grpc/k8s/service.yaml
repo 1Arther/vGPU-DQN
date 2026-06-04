@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: dqn-scheduler-grpc
+  namespace: volcano-system
+  labels:
+    app: dqn-scheduler-grpc
+spec:
+  type: ClusterIP
+  selector:
+    app: dqn-scheduler-grpc
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051

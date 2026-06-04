@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dqn-scheduler-grpc
+  namespace: volcano-system
+  labels:
+    app: dqn-scheduler-grpc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dqn-scheduler-grpc
+  template:
+    metadata:
+      labels:
+        app: dqn-scheduler-grpc
+    spec:
+      containers:
+        - name: grpc
+          image: vgpu-dqn-grpc:v8
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: grpc
+              containerPort: 50051
+          readinessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 6Gi
