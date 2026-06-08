@@ -100,7 +100,7 @@ def plot_overall(overall):
     for off, key, name in [(-width / 2, 'success', 'Success'), (width / 2, 'objective', 'Objective')]:
         axes[0].bar(x + off, overall[key], width=width, label=name,
                     color=[COLORS[m] for m in overall['method']], alpha=0.85 if key == 'success' else 0.55)
-    axes[0].set_title('Higher is better')
+    axes[0].set_title('Success / Objective (higher is better)')
     axes[0].set_xticks(x)
     axes[0].set_xticklabels(labels, rotation=25, ha='right')
     axes[0].grid(axis='y', alpha=0.25, linestyle='--')
@@ -108,6 +108,7 @@ def plot_overall(overall):
     axes[1].bar(x, overall['balance'], width=0.52,
                 color=[COLORS[m] for m in overall['method']], alpha=0.85)
     axes[1].set_title('Balance score (lower is better)')
+    axes[1].set_ylabel('Balance score')
     axes[1].set_xticks(x)
     axes[1].set_xticklabels(labels, rotation=25, ha='right')
     axes[1].grid(axis='y', alpha=0.25, linestyle='--')
