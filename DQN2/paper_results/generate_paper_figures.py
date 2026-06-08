@@ -107,7 +107,7 @@ def plot_overall(overall):
     axes[0].legend(frameon=False)
     axes[1].bar(x, overall['balance'], width=0.52,
                 color=[COLORS[m] for m in overall['method']], alpha=0.85)
-    axes[1].set_title('Lower is better')
+    axes[1].set_title('Balance score (lower is better)')
     axes[1].set_xticks(x)
     axes[1].set_xticklabels(labels, rotation=25, ha='right')
     axes[1].grid(axis='y', alpha=0.25, linestyle='--')
