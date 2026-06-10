@@ -2,6 +2,7 @@ import argparse
 import copy
 import os
 import sys
+import time
 from concurrent import futures
 from types import SimpleNamespace
 from typing import Dict, List, Tuple
@@ -172,15 +173,26 @@ class DQNSchedulerService(pb2_grpc.DQNSchedulerServicer):
             f"rerank_topk={action_rerank_topk}, fallback={fallback}"
         )
 
-    def _schedule(self, gpus: List[Dict], pods: List[Dict]) -> Tuple[List[Dict], bool, str]:
+    def _schedule(self, gpus: List[Dict], pods: List[Dict]) -> Tuple[List[Dict], bool, str, Dict[str, float]]:
         gpus = sorted(copy.deepcopy(gpus), key=lambda x: int(x["gpu_id"]))
         pods = copy.deepcopy(pods)
         allocations: Dict[str, List[int]] = {}
         rows = []
         fallback_used = False
+        metrics = {
+            "steps": 0.0,
+            "graph_build_ms": 0.0,
+            "action_select_ms": 0.0,
+            "helper_select_ms": 0.0,
+            "fallback_select_ms": 0.0,
+            "allocate_ms": 0.0,
+        }
 
         while len(allocations) < len(pods):
+            metrics["steps"] += 1.0
+            graph_start = time.perf_counter()
             graph_data = build_vgpu_graph(gpus, pods, allocations, args=self.args)
+            metrics["graph_build_ms"] += (time.perf_counter() - graph_start) * 1000.0
             valid_mask = torch.tensor(
                 graph_data[2],
                 dtype=torch.float32,
@@ -190,6 +202,7 @@ class DQNSchedulerService(pb2_grpc.DQNSchedulerServicer):
             if not valid_mask.any():
                 break
 
+            action_start = time.perf_counter()
             gpu_idx, pod_idx = select_dqn_action(
                 agent=self.agent,
                 graph_data=graph_data,
@@ -199,23 +212,30 @@ class DQNSchedulerService(pb2_grpc.DQNSchedulerServicer):
                 args=self.args,
                 train=False,
             )
+            metrics["action_select_ms"] += (time.perf_counter() - action_start) * 1000.0
 
             pod = pods[pod_idx]
+            helper_start = time.perf_counter()
             selected = select_gpus_for_pod_by_anchor(
                 gpus=gpus,
                 pod=pod,
                 anchor_gpu_idx=gpu_idx,
                 args=self.args,
             )
+            metrics["helper_select_ms"] += (time.perf_counter() - helper_start) * 1000.0
 
             if selected is None:
                 fallback_used = True
+                fallback_start = time.perf_counter()
                 selected = self._fallback_select(gpus, pod)
+                metrics["fallback_select_ms"] += (time.perf_counter() - fallback_start) * 1000.0
 
             if selected is None:
                 break
 
+            allocate_start = time.perf_counter()
             allocate_pod_to_gpus(gpus, pod, selected)
+            metrics["allocate_ms"] += (time.perf_counter() - allocate_start) * 1000.0
             allocations[pod["task_id"]] = selected
             rows.append(
                 {
@@ -241,7 +261,7 @@ class DQNSchedulerService(pb2_grpc.DQNSchedulerServicer):
                 }
             )
 
-        return rows, fallback_used, "ok"
+        return rows, fallback_used, "ok", metrics
 
     def _fallback_select(self, gpus: List[Dict], pod: Dict):
         required = max(1, int(pod.get("vgpu_number", 1)))
@@ -278,7 +298,9 @@ class DQNSchedulerService(pb2_grpc.DQNSchedulerServicer):
                 reason="empty gpu list",
             )
 
-        rows, fallback_used, reason = self._schedule(gpus, [pod])
+        schedule_start = time.perf_counter()
+        rows, fallback_used, reason, metrics = self._schedule(gpus, [pod])
+        schedule_ms = (time.perf_counter() - schedule_start) * 1000.0
         success_rows = [r for r in rows if r["success"]]
         selected = success_rows[0]["selected_indexes"] if success_rows else []
         ordered = selected + [i for i in fallback_order(gpus, pod, self.fallback) if i not in selected]
@@ -294,6 +316,19 @@ class DQNSchedulerService(pb2_grpc.DQNSchedulerServicer):
             )
             for g in sorted(gpus, key=lambda x: int(x["gpu_id"]))
         ]
+
+        total_ms = schedule_ms
+        print(
+            "[DQN-overhead] "
+            f"method=Predict total_ms={total_ms:.3f} schedule_ms={schedule_ms:.3f} "
+            f"graph_build_ms={metrics['graph_build_ms']:.3f} "
+            f"action_select_ms={metrics['action_select_ms']:.3f} "
+            f"helper_select_ms={metrics['helper_select_ms']:.3f} "
+            f"fallback_select_ms={metrics['fallback_select_ms']:.3f} "
+            f"allocate_ms={metrics['allocate_ms']:.3f} "
+            f"steps={int(metrics['steps'])} pods=1 gpus={len(gpus)} "
+            f"fallback={fallback_used or not bool(selected)}"
+        )
 
         return pb2.PredictResponse(
             ordered_indexes=ordered,
@@ -317,7 +352,20 @@ class DQNSchedulerService(pb2_grpc.DQNSchedulerServicer):
                 reason="empty gpu list",
             )
 
-        rows, fallback_used, reason = self._schedule(gpus, pods)
+        schedule_start = time.perf_counter()
+        rows, fallback_used, reason, metrics = self._schedule(gpus, pods)
+        schedule_ms = (time.perf_counter() - schedule_start) * 1000.0
+        print(
+            "[DQN-overhead] "
+            f"method=ScheduleJob total_ms={schedule_ms:.3f} schedule_ms={schedule_ms:.3f} "
+            f"graph_build_ms={metrics['graph_build_ms']:.3f} "
+            f"action_select_ms={metrics['action_select_ms']:.3f} "
+            f"helper_select_ms={metrics['helper_select_ms']:.3f} "
+            f"fallback_select_ms={metrics['fallback_select_ms']:.3f} "
+            f"allocate_ms={metrics['allocate_ms']:.3f} "
+            f"steps={int(metrics['steps'])} pods={len(pods)} gpus={len(gpus)} "
+            f"fallback={fallback_used} reason={reason}"
+        )
         return pb2.ScheduleJobResponse(
             allocations=[
                 pb2.PodAllocation(

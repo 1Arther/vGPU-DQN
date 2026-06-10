@@ -95,16 +95,18 @@ def plot_overall(overall):
     # Main paper figure: separate higher-is-better and lower-is-better metrics.
     x = np.arange(len(overall))
     labels = [SHORT[m] for m in overall['method']]
-    fig, axes = plt.subplots(1, 2, figsize=(8.4, 3.2))
+    fig, axes = plt.subplots(1, 2, figsize=(8.8, 3.35))
     width = 0.34
     for off, key, name in [(-width / 2, 'success', 'Success'), (width / 2, 'objective', 'Objective')]:
         axes[0].bar(x + off, overall[key], width=width, label=name,
                     color=[COLORS[m] for m in overall['method']], alpha=0.85 if key == 'success' else 0.55)
-    axes[0].set_title('Success / Objective (higher is better)')
+    axes[0].set_ylabel('Success / Objective')
     axes[0].set_xticks(x)
     axes[0].set_xticklabels(labels, rotation=25, ha='right')
     axes[0].grid(axis='y', alpha=0.25, linestyle='--')
-    axes[0].legend(frameon=False)
+    axes[0].legend(frameon=False, loc='upper right', ncol=1)
+    left_values = np.concatenate([overall['success'].to_numpy(), overall['objective'].to_numpy()])
+    axes[0].set_ylim(0.0, max(0.85, float(left_values.max()) * 1.12))
     axes[1].bar(x, overall['balance'], width=0.52,
                 color=[COLORS[m] for m in overall['method']], alpha=0.85)
     axes[1].set_title('Balance score (lower is better)')
@@ -112,7 +114,8 @@ def plot_overall(overall):
     axes[1].set_xticks(x)
     axes[1].set_xticklabels(labels, rotation=25, ha='right')
     axes[1].grid(axis='y', alpha=0.25, linestyle='--')
-    fig.tight_layout()
+    axes[1].set_ylim(0.0, max(0.65, float(overall['balance'].max()) * 1.12))
+    fig.tight_layout(pad=0.8, w_pad=1.6)
     save(fig, 'overall_baseline_grouped')
 
     # Supporting single-metric figures.
